@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="uk">
+
+<head>
+  <meta charset="utf-8" />
+  <title>TEM Simulator (JS)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      margin: 0;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 16px;
+    }
+
+    aside {
+      padding: 16px;
+      border-right: 1px solid #ddd;
+      max-height: 100vh;
+      overflow: auto;
+    }
+
+    main {
+      display: grid;
+      place-items: start;
+      padding: 16px;
+    }
+
+    canvas {
+      image-rendering: pixelated;
+      background: #7f7f7f;
+      box-shadow: 0 0 0 1px #0002, 0 8px 20px #0002;
+    }
+
+    .row {
+      margin-bottom: 10px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      margin-bottom: 6px;
+      color: #333;
+    }
+
+    input[type="text"],
+    input[type="number"],
+    textarea {
+      width: 100%;
+      padding: 6px 8px;
+      box-sizing: border-box;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .checks label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .muted {
+      color: #666;
+      font-size: 12px;
+    }
+
+    /* File button */
+    input[type="file"] {
+      display: none;
+    }
+
+    .file-button {
+      display: inline-block;
+      width: 100%;
+      padding: 8px 10px;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #f3f3f3;
+      cursor: pointer;
+      user-select: none;
+      text-align: center;
+    }
+
+    .file-hint {
+      margin-top: 6px;
+      color: #666;
+      font-size: 12px;
+      line-height: 1.25;
+    }
+  </style>
+
+  <script src="./rdkit/RDKit_minimal.js"></script>
+  <script type="module">
+    import { interactive_em_image } from './js/main.js';
+
+    // RDKit WASM init
+    window.RDKitReady = window.initRDKitModule({
+      locateFile: () => './rdkit/RDKit_minimal.wasm'
+    });
+
+    // Start only after RDKit is ready
+    window.addEventListener('DOMContentLoaded', async () => {
+      await window.RDKitReady;
+      const smiles = "[Ni+2].[O-]C([O-])=O";
+      await interactive_em_image(smiles, "");
+
+      // Global drag & drop (anywhere on the page):
+      // - reads local .cif/.csv as text
+      // - triggers change event so main.js picks it up and rebuilds
+        document.addEventListener('dragover', (ev) => {
+          ev.preventDefault();
+        });
+
+        document.addEventListener('drop', async (ev) => {
+          ev.preventDefault();
+          const files = ev.dataTransfer?.files;
+          if (!files || !files.length) return;
+
+          const f = files[0];
+          const name = (f.name || '').toLowerCase();
+          if (!(name.endsWith('.cif') || name.endsWith('.csv'))) return;
+
+          try {
+            const text = await f.text();
+            solidEl.value = text;
+            solidEl.dispatchEvent(new Event('change', { bubbles: true }));
+          } catch (e) {
+            // ignore
+          }
+        });
+    });
+  </script>
+</head>
+
+<body>
+  <aside>
+    <h3>Панель керування</h3>
+
+    <div class="row checks">
+      <label for="cb-invert"><input type="checkbox" id="cb-invert" /> Інверсія</label>
+      <label for="cb-noise"><input type="checkbox" id="cb-noise" /> Шум</label>
+      <label for="cb-bonds"><input type="checkbox" id="cb-bonds" checked /> Зв'язки</label>
+      <label for="cb-hidefront"><input type="checkbox" id="cb-hidefront" /> Ховати передні шари при розфокусі</label>
+      <label for="cb-scale"><input type="checkbox" id="cb-scale" checked /> Масштаб</label>
+    </div>
+
+    <div class="row">
+      <label for="rng-zoom">Å/pix</label>
+      <input type="range" id="rng-zoom" min="0.01" max="0.5" step="0.005" value="0.1" />
+    </div>
+    <div class="row">
+      <label for="rng-contrast">Контраст</label>
+      <input type="range" id="rng-contrast" min="0.2" max="3.0" step="0.05" value="1.0" />
+    </div>
+    <div class="row">
+      <label for="rng-blur">Розмиття (σ)</label>
+      <input type="range" id="rng-blur" min="0.01" max="3.0" step="0.01" value="1.0" />
+    </div>
+    <div class="row">
+      <label for="rng-noise">Шум (σ)</label>
+      <input type="range" id="rng-noise" min="0.0" max="10.0" step="0.1" value="3.5" />
+    </div>
+    <div class="row">
+      <label for="rng-focus">Фокус Z (норм.)</label>
+      <input type="range" id="rng-focus" min="0.0" max="1.0" step="0.01" value="0.5" />
+    </div>
+    <div class="row">
+      <label for="rng-dof">Розфокус (Å⁻¹)</label>
+      <input type="range" id="rng-dof" min="0.0" max="0.3" step="0.005" value="0.15" />
+    </div>
+    <div class="row">
+      <label for="rng-bwidth">Ширина дуги (px)</label>
+      <input type="range" id="rng-bwidth" min="2" max="24" step="1" value="6" />
+    </div>
+    <div class="row">
+      <label for="rng-bamp">Висота дуги</label>
+      <input type="range" id="rng-bamp" min="0.2" max="3.0" step="0.05" value="0.4" />
+    </div>
+
+    <div class="row grid">
+      <div>
+        <label for="tb-clip-lo">Підлога яскравості</label>
+        <input type="number" id="tb-clip-lo" step="1" min="0" max="255" />
+      </div>
+      <div>
+        <label for="tb-clip-hi">Стеля яскравості</label>
+        <input type="number" id="tb-clip-hi" step="1" min="0" max="255" />
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="tb-tiles">Tiles (для CIF: 2x2x1)</label>
+      <input type="text" id="tb-tiles" placeholder="(порожньо=без size)" />
+    </div>
+
+    <div class="row">
+      <label for="tb-smiles">SMILES</label>
+      <input type="text" id="tb-smiles" />
+    </div>
+
+    <div class="row">
+      <label class="file-button" for="file-input">Завантажити файл (.cif або .csv)</label>
+      <input id="file-input" type="file" accept=".cif,.csv" />
+      <div class="file-hint">Можна також просто перетягнути файл на сторінку (drag&drop) — він завантажиться локально.</div>
+    </div>
+    <div class="row grid">
+      <div>
+        <label for="tb-w">Ширина (px)</label>
+        <input type="number" id="tb-w" value="400" min="128" max="4096" />
+      </div>
+      <div>
+        <label for="tb-h">Висота (px)</label>
+        <input type="number" id="tb-h" value="400" min="128" max="4096" />
+      </div>
+    </div>
+
+    <div class="row grid">
+      <button id="btn-export">Експортувати PNG</button>
+      <span class="muted" id="lbl-title"></span>
+    </div>
+  </aside>
+
+  <main>
+    <canvas id="canvas" width="400" height="400"></canvas>
+  </main>
+</body>
+
+</html>
