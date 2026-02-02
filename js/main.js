@@ -26,6 +26,8 @@ export async function interactive_em_image(smiles_text, _unused) {
     var rngZoom = el('rng-zoom');
     var rngContrast = el('rng-contrast');
     var rngBlur = el('rng-blur');
+    var rngBg = el('rng-bg');
+    var lblBg = el('lbl-bg');
     var rngNoise = el('rng-noise');
     var rngFocus = el('rng-focus');
     var rngDof = el('rng-dof');
@@ -73,6 +75,15 @@ export async function interactive_em_image(smiles_text, _unused) {
         v = Math.min(hi, Math.max(lo, v | 0));
         return v;
     }
+
+    function getBackgroundGray() {
+        var bg = rngBg ? parseInt(rngBg.value, 10) : 127;
+        if (!Number.isFinite(bg)) bg = 127;
+        bg = Math.min(255, Math.max(0, bg | 0));
+        if (lblBg) lblBg.textContent = String(bg);
+        return bg;
+    }
+
 
     function clearCanvas(bg) {
         ctx.save();
@@ -174,7 +185,7 @@ export async function interactive_em_image(smiles_text, _unused) {
         if (cvs.height !== h) cvs.height = h;
 
         if (!atoms || atoms.length === 0) {
-            clearCanvas(127);
+            clearCanvas(getBackgroundGray());
             return;
         }
 
@@ -196,7 +207,7 @@ export async function interactive_em_image(smiles_text, _unused) {
             img_size: [h, w],
             angstroms_per_pixel: rngZoom ? parseFloat(rngZoom.value) : 0.1,
             blur_sigma: rngBlur ? parseFloat(rngBlur.value) : 1.0,
-            background_gray: 127,
+            background_gray: getBackgroundGray(),
             invert: cbInvert ? !!cbInvert.checked : false,
             noise_stddev: (cbNoise && cbNoise.checked && rngNoise) ? parseFloat(rngNoise.value) : 0.0,
             contrast: rngContrast ? parseFloat(rngContrast.value) : 1.0,
@@ -281,9 +292,14 @@ export async function interactive_em_image(smiles_text, _unused) {
     // ---- events ----
 
     // Render-only controls
-    [rngZoom, rngContrast, rngBlur, rngNoise, rngFocus, rngDof, rngBwidth, rngBamp].forEach(function (x) {
-        if (x) x.oninput = scheduleRender;
+    [rngZoom, rngContrast, rngBlur, rngBg, rngNoise, rngFocus, rngDof, rngBwidth, rngBamp].forEach(function (x) {
+        if (!x) return;
+        x.oninput = function () {
+            if (x === rngBg) getBackgroundGray();
+            scheduleRender();
+        };
     });
+
     [cbInvert, cbNoise, cbBonds, cbHide, cbScale].forEach(function (x) {
         if (x) x.onchange = scheduleRender;
     });
@@ -361,5 +377,6 @@ export async function interactive_em_image(smiles_text, _unused) {
 
     // ---- init ----
     active_source = 'smiles';
+    getBackgroundGray();
     await rebuildAndRender();
 }

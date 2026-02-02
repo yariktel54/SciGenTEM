@@ -95,15 +95,35 @@ export function draw_atoms(img, atoms, coords, scale, background_gray, opts = {}
 
         if (hide_front && (atoms[i].z ?? 0) > focal_z + 1e-9) continue;
 
-        // Як у Python: sigma = radiusÅ * scale * 0.3
-        const sigma = Math.max(0.5, radiiA[i] * scale * 0.3);
+        // Реалістична "геометрична" ширина атома: залежить від ковалентного радіуса
+        // atom_size_mul — загальний множник, atom_size_exp — підсилює різницю між H і важкими
+        const atom_size_mul = opts.atom_size_mul ?? 1.2;     // 0.6..1.6 (тюнінг)
+        const atom_size_exp = opts.atom_size_exp ?? 1.25;    // 1.0..1.5 (1.25 дає помітну різницю)
+        const rA = radiiA[i];
+
+        // без "мінімумів": лише числовий захист від нуля
+        const sigma = Math.max(1e-6, Math.pow(rA, atom_size_exp) * scale * atom_size_mul);
+
 
         // Інтенсивність
-        const intensity = -Math.pow(Zs[i], 1.2);
+        const atom_dark_mul = opts.atom_dark_mul ?? 2.5;   // 1.5..4.0
+        const atom_dark_exp = opts.atom_dark_exp ?? 1.2;   // 1.1..1.6
+
+        const baseZ = Math.pow(Zs[i], atom_dark_exp);
+        const intensity = -(baseZ * atom_dark_mul);
 
         // «ядро»
-        const core_sigma = sigma * 0.3;
-        const core_intensity = Math.abs(intensity) * 0.85;
+        const core_sigma_rel = opts.core_sigma_rel ?? 0.18; // 0.12..0.22
+        const core_rel = opts.core_rel ?? 0.6;             // 0.3..0.9
+        const core_Z0 = opts.core_Z0 ?? 12;                // 8..20 (чим менше — тим сильніше "гасить" ядро для металів)
+
+        const core_sigma = sigma * core_sigma_rel;
+
+        // ядро не масштабуємо напряму як intensity, а робимо "контрольованим" і
+        // трохи приглушуємо для великих Z, щоб важкі атоми не виглядали як "однакові круги з білим центром"
+        const core_falloff = 1.0 / (1.0 + (Zs[i] / core_Z0) * (Zs[i] / core_Z0));
+        const core_intensity = baseZ * core_rel * core_falloff;
+
 
         // --- Gaussian "тіло" атома ---
         const R = Math.ceil(3 * sigma);
