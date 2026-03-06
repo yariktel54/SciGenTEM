@@ -800,17 +800,17 @@ export async function interactive_em_image(smiles_text, _unused) {
     },
     "file:UAsSe.cif": {
       kind: "file",
-      path: "/samples/UAsSe.cif",
+      path: "./samples/UAsSe.cif",
       name: "UAsSe.cif",
     },
     "file:UAsSe.poscar": {
       kind: "file",
-      path: "/samples/UAsSe.poscar",
+      path: "./samples/UAsSe.poscar",
       name: "UAsSe.poscar",
     },
     "file:pdb4hhb.ent": {
       kind: "file",
-      path: "/samples/pdb4hhb.ent",
+      path: "./samples/pdb4hhb.ent",
       name: "pdb4hhb.ent",
     },
   };
