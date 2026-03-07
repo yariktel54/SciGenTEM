@@ -104,15 +104,22 @@ const _EO_Z2SYM = [
 
 function _EO_atomSymbol(a) {
   if (!a) return null;
+
+  // Prefer atomic number -> symbol (SMILES/RDKit can mis-populate .sym)
+  let Z = a.Z;
+  if (!Number.isFinite(Z)) Z = parseInt(Z, 10);
+  if (Number.isFinite(Z)) {
+    const zi = Z | 0;
+    if (zi > 0 && zi < _EO_Z2SYM.length) {
+      const zs = _EO_Z2SYM[zi];
+      if (zs) return zs;
+    }
+  }
+
   let s = a.sym || a.el || a.symbol || a.element;
   if (typeof s === "string") {
     s = s.trim();
     if (s) return s;
-  }
-  const Z = a.Z;
-  if (Number.isFinite(Z)) {
-    const zi = Z | 0;
-    if (zi > 0 && zi < _EO_Z2SYM.length) return _EO_Z2SYM[zi] || null;
   }
   return null;
 }
@@ -203,7 +210,9 @@ export function render_afm_like(atoms, opts = {}) {
 
   // --- 1) Height map (surface topography): max of Gaussian bumps ---
   const height = new Float32Array(H * W);
+  const darkField = new Float32Array(H * W);
   let hmax = 0.0;
+  let hasDarkOverride = false;
 
   for (let i = 0; i < atoms.length; i++) {
     const a = atoms[i];
@@ -219,6 +228,7 @@ export function render_afm_like(atoms, opts = {}) {
     // Per-element overrides
     const sym = _EO_atomSymbol(a);
     const [sizeMul, darkMul] = _EO_getMul(ov, sym);
+    if (Math.abs(darkMul - 1.0) > 1e-9) hasDarkOverride = true;
 
     // sigma: same geometric logic as TEM atoms (size ~ covalent radius)
     let sigma = Math.max(
@@ -229,17 +239,22 @@ export function render_afm_like(atoms, opts = {}) {
     const typical_bond_A = 1.4;
     const cap_rel_bond = 0.55;
     const cap_abs_px = 24.0;
-    const cap_px = Math.min(
+    const cap_px0 = Math.min(
       cap_abs_px,
       Math.max(1.5, cap_rel_bond * typical_bond_A * scale),
     );
+    const cap_px = cap_px0 * (Number.isFinite(sizeMul) ? sizeMul : 1.0);
     if (sigma > cap_px) sigma = cap_px;
 
     const R = Math.ceil(4 * sigma);
 
     if (x0 + R < 0 || x0 - R >= W || y0 + R < 0 || y0 - R >= H) continue;
 
-    const amp = darkMul * Math.max(0.05, Math.min(3.0, rA)); // size-driven; later normalized by hmax
+    // NOTE:
+    //  - height/topography should stay geometric; otherwise dark overrides get swallowed
+    //    by global normalization (preview shows ~no change, full image redistributes maxima).
+    //  - keep geometry in `height`, and apply darkness later via local contrast field.
+    const baseAmp = Math.max(0.05, Math.min(3.0, rA));
 
     const x0i = Math.floor(x0);
     const y0i = Math.floor(y0);
@@ -258,12 +273,17 @@ export function render_afm_like(atoms, opts = {}) {
       const wyv = wy[y - y0i + R];
       const row = y * W;
       for (let x = xStart; x <= xEnd; x++) {
-        const bump = amp * (wx[x - x0i + R] * wyv);
-        if (bump <= 1e-6) continue;
-        const p = row + x;
-        if (bump > height[p]) {
-          height[p] = bump;
-          if (bump > hmax) hmax = bump;
+        const g = wx[x - x0i + R] * wyv;
+        const bump = baseAmp * g;
+        if (bump > 1e-6) {
+          const p = row + x;
+          if (bump > height[p]) {
+            height[p] = bump;
+            if (bump > hmax) hmax = bump;
+          }
+          if (Math.abs(darkMul - 1.0) > 1e-9) {
+            darkField[p] += (darkMul - 1.0) * g;
+          }
         }
       }
     }
@@ -320,6 +340,18 @@ export function render_afm_like(atoms, opts = {}) {
   const K2 = 44.0;
   for (let p = 0; p < img.a.length; p++) {
     img.a[p] = background_gray - (K1 * height[p] + K2 * edge[p]);
+  }
+
+  // Local darkness modulation:
+  // apply AFTER topography normalization so darkness really changes tone,
+  // but BEFORE bonds/postprocess so it does not alter depth slicing semantics.
+  if (hasDarkOverride) {
+    for (let p = 0; p < img.a.length; p++) {
+      let localDark = 1.0 + darkField[p];
+      if (localDark < 0.05) localDark = 0.05;
+      const d = background_gray - img.a[p];
+      img.a[p] = background_gray - d * localDark;
+    }
   }
 
   // --- 4) AFM "bond contrast" overlay (single line per bond; bt ignored) ---

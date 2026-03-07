@@ -34,15 +34,22 @@ const _EO_Z2SYM = [
 
 function _EO_atomSymbol(a) {
   if (!a) return null;
+
+  // Prefer atomic number -> symbol (SMILES/RDKit can mis-populate .sym)
+  let Z = a.Z;
+  if (!Number.isFinite(Z)) Z = parseInt(Z, 10);
+  if (Number.isFinite(Z)) {
+    const zi = Z | 0;
+    if (zi > 0 && zi < _EO_Z2SYM.length) {
+      const zs = _EO_Z2SYM[zi];
+      if (zs) return zs;
+    }
+  }
+
   let s = a.sym || a.el || a.symbol || a.element;
   if (typeof s === "string") {
     s = s.trim();
     if (s) return s;
-  }
-  const Z = a.Z;
-  if (Number.isFinite(Z)) {
-    const zi = Z | 0;
-    if (zi > 0 && zi < _EO_Z2SYM.length) return _EO_Z2SYM[zi] || null;
   }
   return null;
 }
@@ -102,7 +109,8 @@ export function draw_atoms(img, atoms, coords, scale, background_gray, opts = {}
         const typical_bond_A = opts.typical_bond_A ?? 1.40;               // Å
         const cap_rel_bond = opts.atom_sigma_cap_rel_bond ?? 0.55;        // частка від bondPx
         const cap_abs_px = opts.atom_sigma_cap_abs_px ?? 24.0;            // абсолютний safety-cap
-        const cap_px = Math.min(cap_abs_px, Math.max(1.5, cap_rel_bond * typical_bond_A * scale));
+        const cap_px0 = Math.min(cap_abs_px, Math.max(1.5, cap_rel_bond * typical_bond_A * scale));
+        const cap_px = cap_px0 * (Number.isFinite(sizeMul) ? sizeMul : 1.0);
         if (sigma > cap_px) sigma = cap_px;
 
         // Інтенсивність

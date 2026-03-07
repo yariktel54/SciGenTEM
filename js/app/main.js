@@ -138,6 +138,10 @@ export async function interactive_em_image(smiles_text, _unused) {
   // SMILES error de-dup (avoid alert spam for same input)
   var lastSmilesErrorToken = "";
 
+  // SMILES atom identity cache (fixes cases where SMILES provider returns wrong/empty Z/sym).
+  // Filled on successful SMILES build; applied before rendering + element overrides table.
+  var _smilesAtomZCache = { token: "", Zs: null, syms: null };
+
   // currently loaded file (if any)
   var file_state = {
     kind: null, // 'cif' | 'csv' | 'xyz' | 'json' | 'poscar' | null
@@ -149,13 +153,14 @@ export async function interactive_em_image(smiles_text, _unused) {
   // ---- Element overrides (global per-element multipliers) ----
   // { "H": { size: 1.0, dark: 1.0 }, "O": { size: 1.2, dark: 0.8 } }
   var elementOverrides = {};
-  var _elemList = []; // currently displayed elements (symbols)
-  var _elemListKey = ""; // cache key for quick equality
+  var _elemList = [];        // currently displayed elements (symbols)
+  var _elemListKey = "";     // cache key for quick equality
   var _elemReprAtoms = Object.create(null); // sym -> representative atom (from current view)
   var _elemPreviewCanvasBySym = Object.create(null); // sym -> preview canvas
   var _elemPreviewRafPending = false;
   var _elemPreviewQueueAll = false;
   var _elemPreviewQueueSyms = Object.create(null);
+
 
   // ---- GIF recording ----
   // Recording is session-based: Start begins (or resumes) a session, Stop pauses it,
@@ -281,6 +286,355 @@ export async function interactive_em_image(smiles_text, _unused) {
     }
   }
 
+  function _normElemSym(s) {
+    if (typeof s !== "string") return null;
+    s = s.trim();
+    if (!s) return null;
+    if (s.length === 1) return s.toUpperCase();
+    return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+  }
+
+  function _rdkitParseAtomSymsFromMolblock(molblock) {
+    if (typeof molblock !== "string" || !molblock) return null;
+    var lines = molblock.replace(/\r/g, "").split("\n");
+    if (!lines.length) return null;
+
+    var hasV3000 = false;
+    for (var i = 0; i < Math.min(lines.length, 12); i++) {
+      if (String(lines[i] || "").indexOf("V3000") >= 0) {
+        hasV3000 = true;
+        break;
+      }
+    }
+
+    if (hasV3000) {
+      var out3 = [];
+      var inAtoms = false;
+      for (var j = 0; j < lines.length; j++) {
+        var ln3 = String(lines[j] || "").trim();
+        if (!ln3) continue;
+        if (ln3.indexOf("M  V30 BEGIN ATOM") === 0) {
+          inAtoms = true;
+          continue;
+        }
+        if (ln3.indexOf("M  V30 END ATOM") === 0) break;
+        if (!inAtoms) continue;
+        if (ln3.indexOf("M  V30 ") !== 0) continue;
+        var parts3 = ln3.split(/\s+/);
+        if (parts3.length < 5) continue;
+        var sym3 = _normElemSym(parts3[3]);
+        if (sym3) out3.push(sym3);
+      }
+      return out3.length ? out3 : null;
+    }
+
+    if (lines.length < 4) return null;
+    var counts = String(lines[3] || "");
+    var atomCount = parseInt(counts.slice(0, 3), 10);
+    if (!Number.isFinite(atomCount) || atomCount <= 0) {
+      var m = counts.match(/^\s*(\d+)/);
+      atomCount = m ? parseInt(m[1], 10) : 0;
+    }
+    atomCount = atomCount | 0;
+    if (atomCount <= 0) return null;
+    if (lines.length < 4 + atomCount) return null;
+
+    var out2 = new Array(atomCount);
+    for (var k = 0; k < atomCount; k++) {
+      var ln2 = String(lines[4 + k] || "");
+      var sym2 = _normElemSym(ln2.slice(31, 34));
+      if (!sym2) {
+        var parts2 = ln2.trim().split(/\s+/);
+        if (parts2.length >= 4) sym2 = _normElemSym(parts2[3]);
+      }
+      out2[k] = sym2 || null;
+    }
+    return out2;
+  }
+
+  function _rdkitParseAtomInfoFromJson(jsonText) {
+    if (typeof jsonText !== "string" || !jsonText) return null;
+
+    var root = null;
+    try {
+      root = JSON.parse(jsonText);
+    } catch (e0) {
+      return null;
+    }
+    if (!root || typeof root !== "object") return null;
+
+    var mol = root;
+    if (Array.isArray(root.molecules) && root.molecules.length) mol = root.molecules[0];
+    if (!mol || typeof mol !== "object") return null;
+
+    var atoms = Array.isArray(mol.atoms)
+      ? mol.atoms
+      : mol.mol && Array.isArray(mol.mol.atoms)
+        ? mol.mol.atoms
+        : null;
+    if (!Array.isArray(atoms) || !atoms.length) return null;
+
+    var syms = new Array(atoms.length);
+    var zs = new Array(atoms.length);
+    var any = false;
+
+    for (var i = 0; i < atoms.length; i++) {
+      var a = atoms[i] || {};
+      var z = 0;
+      if (Number.isFinite(a.z)) z = a.z | 0;
+      else if (Number.isFinite(a.atomicNum)) z = a.atomicNum | 0;
+      else if (Number.isFinite(a.atomic_num)) z = a.atomic_num | 0;
+
+      var sym = null;
+      if (z > 0 && _Z2SYM && z < _Z2SYM.length) sym = _Z2SYM[z];
+      if (!sym) {
+        sym = _normElemSym(
+          a.symbol || a.sym || a.el || a.element || a.atom || a.label,
+        );
+      }
+      if (!z && sym && _SYM2Z && _SYM2Z[sym]) z = _SYM2Z[sym] | 0;
+
+      syms[i] = sym || null;
+      zs[i] = z > 0 ? z : 0;
+      if (syms[i] || zs[i]) any = true;
+    }
+
+    return any ? { Zs: zs, syms: syms } : null;
+  }
+
+  // Extract per-atom atomic numbers/symbols from RDKit for SMILES.
+  // Returns { Zs:Array<int>|null, syms:Array<string>|null } or null.
+  async function rdkitGetAtomZs(smiles) {
+    smiles = trimStr(smiles);
+    if (!smiles) smiles = "O";
+
+    var mol = null;
+    try {
+      if (!window.RDKitReady) return null;
+      var rdkit = await window.RDKitReady;
+      if (!rdkit) return null;
+
+      if (typeof rdkit.get_mol === "function") mol = rdkit.get_mol(smiles);
+      else if (typeof rdkit.getMol === "function") mol = rdkit.getMol(smiles);
+      else return null;
+
+      if (!mol) return null;
+
+      var n = 0;
+      try {
+        if (typeof mol.get_num_atoms === "function") n = mol.get_num_atoms();
+        else if (typeof mol.getNumAtoms === "function") n = mol.getNumAtoms();
+      } catch (e0) {
+        n = 0;
+      }
+
+      n = n | 0;
+      if (n <= 0) {
+        try {
+          mol.delete();
+        } catch (e1) {}
+        return null;
+      }
+
+      var zs = new Array(n);
+      var syms = new Array(n);
+      var okCount = 0;
+
+      for (var i = 0; i < n; i++) {
+        var at = null;
+        try {
+          if (typeof mol.get_atom_with_idx === "function") at = mol.get_atom_with_idx(i);
+          else if (typeof mol.getAtomWithIdx === "function") at = mol.getAtomWithIdx(i);
+        } catch (e2) {
+          at = null;
+        }
+
+        var z = 0;
+        var sym = null;
+        if (at) {
+          try {
+            if (typeof at.get_atomic_num === "function") z = at.get_atomic_num();
+            else if (typeof at.getAtomicNum === "function") z = at.getAtomicNum();
+          } catch (e3) {
+            z = 0;
+          }
+          try {
+            if (typeof at.get_symbol === "function") sym = at.get_symbol();
+            else if (typeof at.getSymbol === "function") sym = at.getSymbol();
+          } catch (e4) {
+            sym = null;
+          }
+          try {
+            if (typeof at.delete === "function") at.delete();
+          } catch (e5) {}
+        }
+
+        z = (z | 0) > 0 ? (z | 0) : 0;
+        sym = _normElemSym(sym);
+        if (!sym && z > 0 && _Z2SYM && z < _Z2SYM.length) sym = _Z2SYM[z];
+        if (!z && sym && _SYM2Z && _SYM2Z[sym]) z = _SYM2Z[sym] | 0;
+
+        zs[i] = z;
+        syms[i] = sym || null;
+        if (z > 0 || sym) okCount++;
+      }
+
+      if (okCount < n) {
+        var infoJson = null;
+        try {
+          if (typeof mol.get_json === "function") {
+            infoJson = _rdkitParseAtomInfoFromJson(mol.get_json());
+          } else if (typeof mol.getJson === "function") {
+            infoJson = _rdkitParseAtomInfoFromJson(mol.getJson());
+          }
+        } catch (e6) {
+          infoJson = null;
+        }
+        if (infoJson && Array.isArray(infoJson.syms) && infoJson.syms.length === n) {
+          for (var j = 0; j < n; j++) {
+            if (!syms[j] && infoJson.syms[j]) syms[j] = infoJson.syms[j];
+            if ((!zs[j] || zs[j] <= 0) && infoJson.Zs && (infoJson.Zs[j] | 0) > 0) {
+              zs[j] = infoJson.Zs[j] | 0;
+            }
+          }
+        }
+      }
+
+      var needMolblock = false;
+      for (var t = 0; t < n; t++) {
+        if (!syms[t]) {
+          needMolblock = true;
+          break;
+        }
+      }
+      if (needMolblock) {
+        var molSyms = null;
+        try {
+          if (typeof mol.get_molblock === "function") molSyms = _rdkitParseAtomSymsFromMolblock(mol.get_molblock());
+          else if (typeof mol.getMolblock === "function") molSyms = _rdkitParseAtomSymsFromMolblock(mol.getMolblock());
+        } catch (e7) {
+          molSyms = null;
+        }
+        if (Array.isArray(molSyms) && molSyms.length === n) {
+          for (var q = 0; q < n; q++) {
+            if (!syms[q] && molSyms[q]) syms[q] = molSyms[q];
+          }
+        }
+      }
+
+      for (var u = 0; u < n; u++) {
+        if ((!zs[u] || zs[u] <= 0) && syms[u] && _SYM2Z && _SYM2Z[syms[u]]) {
+          zs[u] = _SYM2Z[syms[u]] | 0;
+        }
+        if (!syms[u] && (zs[u] | 0) > 0 && _Z2SYM && zs[u] < _Z2SYM.length) {
+          syms[u] = _Z2SYM[zs[u] | 0];
+        }
+      }
+
+      try {
+        mol.delete();
+      } catch (e8) {}
+      return { Zs: zs, syms: syms };
+    } catch (e) {
+      try {
+        if (mol) mol.delete();
+      } catch (e9) {}
+      return null;
+    }
+  }
+
+  function _smilesSourceIdx(a) {
+    if (!a || typeof a !== "object") return -1;
+    var keys = [
+      "atom_idx",
+      "atomIdx",
+      "atomIndex",
+      "rdkit_idx",
+      "rdkitIdx",
+      "source_idx",
+      "sourceIdx",
+      "idx",
+      "index",
+    ];
+    for (var i = 0; i < keys.length; i++) {
+      var v = a[keys[i]];
+      if (!Number.isFinite(v)) v = parseInt(v, 10);
+      if (Number.isFinite(v)) return v | 0;
+    }
+    return -1;
+  }
+
+  function _applySmilesAtomIdentity(a, z, sym) {
+    if (!a) return;
+
+    var zi = Number.isFinite(z) ? (z | 0) : parseInt(z, 10);
+    if (!Number.isFinite(zi)) zi = 0;
+    zi = zi | 0;
+
+    var s = _normElemSym(sym);
+    if (!s && zi > 0 && _Z2SYM && zi < _Z2SYM.length) s = _Z2SYM[zi];
+    if ((!zi || zi <= 0) && s && _SYM2Z && _SYM2Z[s]) zi = _SYM2Z[s] | 0;
+
+    if (zi > 0) a.Z = zi;
+    if (s) a.sym = s;
+  }
+
+  function applySmilesAtomZsIfAvailable(atoms) {
+    if (!atoms || !atoms.length) return;
+    if (!_smilesAtomZCache) return;
+
+    var hasZs = Array.isArray(_smilesAtomZCache.Zs) && _smilesAtomZCache.Zs.length > 0;
+    var hasSyms = Array.isArray(_smilesAtomZCache.syms) && _smilesAtomZCache.syms.length > 0;
+    if (!hasZs && !hasSyms) return;
+
+    var tok = trimStr(tbSmiles ? tbSmiles.value : "") || "O";
+    if (_smilesAtomZCache.token && tok !== _smilesAtomZCache.token) return;
+
+    var zs = hasZs ? _smilesAtomZCache.Zs : null;
+    var syms = hasSyms ? _smilesAtomZCache.syms : null;
+    var srcLen = Math.max(zs ? zs.length : 0, syms ? syms.length : 0) | 0;
+    if (srcLen <= 0) return;
+
+    var mapByIdx = true;
+    var used = Object.create(null);
+    var mapped = 0;
+    for (var i = 0; i < atoms.length; i++) {
+      var srcIdx = _smilesSourceIdx(atoms[i]);
+      if (srcIdx < 0 || srcIdx >= srcLen || used[srcIdx]) {
+        mapByIdx = false;
+        break;
+      }
+      used[srcIdx] = true;
+      _applySmilesAtomIdentity(atoms[i], zs ? zs[srcIdx] : 0, syms ? syms[srcIdx] : null);
+      mapped++;
+    }
+    if (mapByIdx && mapped === atoms.length) return;
+
+    if (atoms.length === srcLen) {
+      for (var j = 0; j < atoms.length; j++) {
+        _applySmilesAtomIdentity(atoms[j], zs ? zs[j] : 0, syms ? syms[j] : null);
+      }
+      return;
+    }
+
+    var srcNonH = [];
+    for (var k = 0; k < srcLen; k++) {
+      var sym = syms && syms[k] ? _normElemSym(syms[k]) : null;
+      var z = zs ? (zs[k] | 0) : 0;
+      if (!sym && z > 0 && _Z2SYM && z < _Z2SYM.length) sym = _Z2SYM[z];
+      if (!z && sym && _SYM2Z && _SYM2Z[sym]) z = _SYM2Z[sym] | 0;
+      if (sym === "H" || z === 1) continue;
+      srcNonH.push(k);
+    }
+
+    if (srcNonH.length === atoms.length) {
+      for (var q = 0; q < atoms.length; q++) {
+        var src = srcNonH[q];
+        _applySmilesAtomIdentity(atoms[q], zs ? zs[src] : 0, syms ? syms[src] : null);
+      }
+    }
+  }
+
   // Centralized SMILES rebuild helper (used by input, Enter, and Samples dropdown).
   function scheduleSmilesRebuild(opts) {
     active_source = "smiles";
@@ -299,124 +653,19 @@ export async function interactive_em_image(smiles_text, _unused) {
   // Many providers keep only Z, so we use a minimal Z->symbol table as a fallback.
   var _Z2SYM = [
     null,
-    "H",
-    "He",
-    "Li",
-    "Be",
-    "B",
-    "C",
-    "N",
-    "O",
-    "F",
-    "Ne",
-    "Na",
-    "Mg",
-    "Al",
-    "Si",
-    "P",
-    "S",
-    "Cl",
-    "Ar",
-    "K",
-    "Ca",
-    "Sc",
-    "Ti",
-    "V",
-    "Cr",
-    "Mn",
-    "Fe",
-    "Co",
-    "Ni",
-    "Cu",
-    "Zn",
-    "Ga",
-    "Ge",
-    "As",
-    "Se",
-    "Br",
-    "Kr",
-    "Rb",
-    "Sr",
-    "Y",
-    "Zr",
-    "Nb",
-    "Mo",
-    "Tc",
-    "Ru",
-    "Rh",
-    "Pd",
-    "Ag",
-    "Cd",
-    "In",
-    "Sn",
-    "Sb",
-    "Te",
-    "I",
-    "Xe",
-    "Cs",
-    "Ba",
-    "La",
-    "Ce",
-    "Pr",
-    "Nd",
-    "Pm",
-    "Sm",
-    "Eu",
-    "Gd",
-    "Tb",
-    "Dy",
-    "Ho",
-    "Er",
-    "Tm",
-    "Yb",
-    "Lu",
-    "Hf",
-    "Ta",
-    "W",
-    "Re",
-    "Os",
-    "Ir",
-    "Pt",
-    "Au",
-    "Hg",
-    "Tl",
-    "Pb",
-    "Bi",
-    "Po",
-    "At",
-    "Rn",
-    "Fr",
-    "Ra",
-    "Ac",
-    "Th",
-    "Pa",
-    "U",
-    "Np",
-    "Pu",
-    "Am",
-    "Cm",
-    "Bk",
-    "Cf",
-    "Es",
-    "Fm",
-    "Md",
-    "No",
-    "Lr",
-    "Rf",
-    "Db",
-    "Sg",
-    "Bh",
-    "Hs",
-    "Mt",
-    "Ds",
-    "Rg",
-    "Cn",
-    "Nh",
-    "Fl",
-    "Mc",
-    "Lv",
-    "Ts",
-    "Og",
+    "H","He",
+    "Li","Be","B","C","N","O","F","Ne",
+    "Na","Mg","Al","Si","P","S","Cl","Ar",
+    "K","Ca","Sc","Ti","V","Cr","Mn","Fe","Co","Ni","Cu","Zn",
+    "Ga","Ge","As","Se","Br","Kr",
+    "Rb","Sr","Y","Zr","Nb","Mo","Tc","Ru","Rh","Pd","Ag","Cd",
+    "In","Sn","Sb","Te","I","Xe",
+    "Cs","Ba","La","Ce","Pr","Nd","Pm","Sm","Eu","Gd","Tb","Dy","Ho","Er","Tm","Yb","Lu",
+    "Hf","Ta","W","Re","Os","Ir","Pt","Au","Hg",
+    "Tl","Pb","Bi","Po","At","Rn",
+    "Fr","Ra","Ac","Th","Pa","U","Np","Pu","Am","Cm","Bk","Cf","Es","Fm","Md","No","Lr",
+    "Rf","Db","Sg","Bh","Hs","Mt","Ds","Rg","Cn",
+    "Nh","Fl","Mc","Lv","Ts","Og"
   ];
 
   // Fast symbol -> Z lookup (best effort). Used for preview when providers omit Z.
@@ -431,23 +680,24 @@ export async function interactive_em_image(smiles_text, _unused) {
 
   function atomSymbol(a) {
     if (!a) return null;
+
+    // Prefer atomic number -> symbol (SMILES/RDKit sometimes mis-populates .sym)
+    var Z = a.Z;
+    if (!Number.isFinite(Z)) Z = parseInt(Z, 10);
+    if (Number.isFinite(Z)) {
+      Z = Z | 0;
+      if (Z > 0 && Z < _Z2SYM.length) {
+        var zs = _Z2SYM[Z];
+        if (zs) return zs;
+      }
+    }
+
     var s =
-      a.sym ||
-      a.el ||
-      a.symbol ||
-      a.element ||
-      a.Sym ||
-      a.El ||
-      a.Symbol ||
-      a.Element;
+      a.sym || a.el || a.symbol || a.element ||
+      a.Sym || a.El || a.Symbol || a.Element;
     if (typeof s === "string") {
       s = s.trim();
       if (s) return s;
-    }
-    var Z = a.Z;
-    if (Number.isFinite(Z)) {
-      Z = Z | 0;
-      if (Z > 0 && Z < _Z2SYM.length) return _Z2SYM[Z] || null;
     }
     return null;
   }
@@ -470,7 +720,7 @@ export async function interactive_em_image(smiles_text, _unused) {
       var sym = atomSymbol(a);
       if (!sym) continue;
       if (mapZ[sym] != null) continue;
-      var z = a && Number.isFinite(a.Z) ? a.Z | 0 : null;
+      var z = a && Number.isFinite(a.Z) ? (a.Z | 0) : null;
       mapZ[sym] = z;
       mapAtom[sym] = a;
       out.push(sym);
@@ -480,8 +730,7 @@ export async function interactive_em_image(smiles_text, _unused) {
     out.sort(function (a, b) {
       var za = mapZ[a];
       var zb = mapZ[b];
-      if (Number.isFinite(za) && Number.isFinite(zb) && za !== zb)
-        return za - zb;
+      if (Number.isFinite(za) && Number.isFinite(zb) && za !== zb) return za - zb;
       if (Number.isFinite(za) && !Number.isFinite(zb)) return -1;
       if (!Number.isFinite(za) && Number.isFinite(zb)) return 1;
       return String(a).localeCompare(String(b));
@@ -517,8 +766,7 @@ export async function interactive_em_image(smiles_text, _unused) {
 
       var syms = [];
       for (var k in _elemPreviewQueueSyms) {
-        if (Object.prototype.hasOwnProperty.call(_elemPreviewQueueSyms, k))
-          syms.push(k);
+        if (Object.prototype.hasOwnProperty.call(_elemPreviewQueueSyms, k)) syms.push(k);
       }
       _elemPreviewQueueSyms = Object.create(null);
       for (var i = 0; i < syms.length; i++) renderElementPreview(syms[i]);
@@ -528,8 +776,7 @@ export async function interactive_em_image(smiles_text, _unused) {
   function renderAllElementPreviews() {
     if (!elemOvDetails || !elemOvDetails.open) return;
     if (!_elemList || !_elemList.length) return;
-    for (var i = 0; i < _elemList.length; i++)
-      renderElementPreview(_elemList[i]);
+    for (var i = 0; i < _elemList.length; i++) renderElementPreview(_elemList[i]);
   }
 
   function renderElementPreview(sym) {
@@ -549,7 +796,7 @@ export async function interactive_em_image(smiles_text, _unused) {
 
     // Representative Z (best effort)
     var repr = _elemReprAtoms ? _elemReprAtoms[sym] : null;
-    var Z = repr && Number.isFinite(repr.Z) ? repr.Z | 0 : _SYM2Z[sym] || 6;
+    var Z = repr && Number.isFinite(repr.Z) ? (repr.Z | 0) : (_SYM2Z[sym] || 6);
     if (!Number.isFinite(Z) || Z <= 0) Z = 6;
 
     // Preview zoom: keep within a visible band
@@ -585,19 +832,15 @@ export async function interactive_em_image(smiles_text, _unused) {
       background_gray: getBackgroundGray(),
       invert: cbInvert ? !!cbInvert.checked : false,
       noise_stddev:
-        cbNoise && cbNoise.checked && rngNoise
-          ? parseFloat(rngNoise.value)
-          : 0.0,
+        cbNoise && cbNoise.checked && rngNoise ? parseFloat(rngNoise.value) : 0.0,
       contrast: rngContrast ? parseFloat(rngContrast.value) : 1.0,
       compose_mode: "sum",
       draw_bonds_flag: false,
       camera: cam,
       bond_wave_width_px: rngBwidth ? parseFloat(rngBwidth.value) : 6,
       bond_wave_amplitude: rngBamp ? parseFloat(rngBamp.value) : 0.4,
-      low_clip:
-        tbClipLo && tbClipLo.value !== "" ? parseFloat(tbClipLo.value) : null,
-      high_clip:
-        tbClipHi && tbClipHi.value !== "" ? parseFloat(tbClipHi.value) : null,
+      low_clip: tbClipLo && tbClipLo.value !== "" ? parseFloat(tbClipLo.value) : null,
+      high_clip: tbClipHi && tbClipHi.value !== "" ? parseFloat(tbClipHi.value) : null,
       focal_z: 0,
       dof_strength: rngDof ? parseFloat(rngDof.value) : 0.0,
       hide_front: false,
@@ -627,8 +870,7 @@ export async function interactive_em_image(smiles_text, _unused) {
     _elemList = elements.slice(0);
 
     // Clear
-    while (elemOvTableWrap.firstChild)
-      elemOvTableWrap.removeChild(elemOvTableWrap.firstChild);
+    while (elemOvTableWrap.firstChild) elemOvTableWrap.removeChild(elemOvTableWrap.firstChild);
 
     _elemPreviewCanvasBySym = Object.create(null);
 
@@ -658,10 +900,7 @@ export async function interactive_em_image(smiles_text, _unused) {
       inp.step = "0.1";
       inp.min = "0.2";
 
-      var cur =
-        elementOverrides && elementOverrides[sym]
-          ? elementOverrides[sym]
-          : null;
+      var cur = elementOverrides && elementOverrides[sym] ? elementOverrides[sym] : null;
       var v = 1.0;
       if (cur && field === "size" && Number.isFinite(cur.size)) v = cur.size;
       if (cur && field === "dark" && Number.isFinite(cur.dark)) v = cur.dark;
@@ -673,8 +912,7 @@ export async function interactive_em_image(smiles_text, _unused) {
         inp.value = String(vv);
 
         if (!elementOverrides) elementOverrides = {};
-        if (!elementOverrides[sym])
-          elementOverrides[sym] = { size: 1.0, dark: 1.0 };
+        if (!elementOverrides[sym]) elementOverrides[sym] = { size: 1.0, dark: 1.0 };
         elementOverrides[sym][field] = vv;
 
         scheduleRender(); // rerender only (no rebuild/parsing)
@@ -722,6 +960,7 @@ export async function interactive_em_image(smiles_text, _unused) {
     // Previews: rerender when panel is open
     scheduleElemPreviewAll();
   }
+
 
   function clampInt(n, lo, hi, fallback) {
     var v = parseInt(n, 10);
@@ -919,19 +1158,19 @@ export async function interactive_em_image(smiles_text, _unused) {
       kind: "smiles",
       smiles: "c1ccccc1",
     },
-    "file:Graphite.cif": {
+    "file:UAsSe.cif": {
       kind: "file",
-      path: "./samples/Graphite.cif",
-      name: "Graphite.cif",
+      path: "/samples/UAsSe.cif",
+      name: "UAsSe.cif",
     },
-    "file:Corundum.poscar": {
+    "file:UAsSe.poscar": {
       kind: "file",
-      path: "./samples/Corundum.poscar",
-      name: "Corundum.poscar",
+      path: "/samples/UAsSe.poscar",
+      name: "UAsSe.poscar",
     },
     "file:pdb4hhb.ent": {
       kind: "file",
-      path: "./samples/pdb4hhb.ent",
+      path: "/samples/pdb4hhb.ent",
       name: "pdb4hhb.ent",
     },
   };
@@ -1333,6 +1572,24 @@ export async function interactive_em_image(smiles_text, _unused) {
 
       provider = newProvider;
 
+      // Cache per-atom identity from RDKit for SMILES to avoid cases where provider atoms lose Z/sym.
+      try {
+        var _smilesAtomInfo = await rdkitGetAtomZs(spec);
+        _smilesAtomZCache.token = spec;
+        _smilesAtomZCache.Zs =
+          _smilesAtomInfo && Array.isArray(_smilesAtomInfo.Zs)
+            ? _smilesAtomInfo.Zs
+            : null;
+        _smilesAtomZCache.syms =
+          _smilesAtomInfo && Array.isArray(_smilesAtomInfo.syms)
+            ? _smilesAtomInfo.syms
+            : null;
+      } catch (e3) {
+        _smilesAtomZCache.token = spec;
+        _smilesAtomZCache.Zs = null;
+        _smilesAtomZCache.syms = null;
+      }
+
       // success => hide error and reset de-dup token
       setSmilesErrorVisible(false);
       lastSmilesErrorToken = "";
@@ -1422,6 +1679,13 @@ export async function interactive_em_image(smiles_text, _unused) {
       return;
     }
 
+    // SMILES: ensure atoms have correct Z (and sym) before overrides/UI gather.
+    if (active_source === "smiles") {
+      try {
+        applySmilesAtomZsIfAvailable(atoms);
+      } catch (e0) {}
+    }
+
     // Update element overrides UI (after we have atoms for this view)
     try {
       var elems = gatherElementsFromAtoms(atoms);
@@ -1433,6 +1697,7 @@ export async function interactive_em_image(smiles_text, _unused) {
     } catch (e) {
       // silent
     }
+
 
     // focal_z from atoms
     var focus_norm = rngFocus ? parseFloat(rngFocus.value) : 0.5;
@@ -1769,6 +2034,7 @@ export async function interactive_em_image(smiles_text, _unused) {
     return out;
   }
 
+
   function buildFullOverridesForExport() {
     var out = {};
     // Export a FULL config: include all periodic table elements.
@@ -1777,10 +2043,7 @@ export async function interactive_em_image(smiles_text, _unused) {
       for (var Z = 1; Z < _Z2SYM.length; Z++) {
         var sym = _Z2SYM[Z];
         if (!sym) continue;
-        var it =
-          elementOverrides && elementOverrides[sym]
-            ? elementOverrides[sym]
-            : null;
+        var it = elementOverrides && elementOverrides[sym] ? elementOverrides[sym] : null;
         var sz = it && Number.isFinite(it.size) ? it.size : 1.0;
         var dk = it && Number.isFinite(it.dark) ? it.dark : 1.0;
         out[sym] = { size: sz, dark: dk };
@@ -1789,18 +2052,11 @@ export async function interactive_em_image(smiles_text, _unused) {
     // Preserve any extra keys (non-periodic pseudo-elements) if present.
     if (elementOverrides) {
       for (var k in elementOverrides) {
-        if (!Object.prototype.hasOwnProperty.call(elementOverrides, k))
-          continue;
+        if (!Object.prototype.hasOwnProperty.call(elementOverrides, k)) continue;
         if (out[k]) continue;
         var it2 = elementOverrides[k];
-        var sz2 =
-          it2 && typeof it2 === "object" && Number.isFinite(it2.size)
-            ? it2.size
-            : 1.0;
-        var dk2 =
-          it2 && typeof it2 === "object" && Number.isFinite(it2.dark)
-            ? it2.dark
-            : 1.0;
+        var sz2 = it2 && typeof it2 === "object" && Number.isFinite(it2.size) ? it2.size : 1.0;
+        var dk2 = it2 && typeof it2 === "object" && Number.isFinite(it2.dark) ? it2.dark : 1.0;
         out[k] = { size: sz2, dark: dk2 };
       }
     }
@@ -1816,10 +2072,7 @@ export async function interactive_em_image(smiles_text, _unused) {
       var text = JSON.stringify(payload, null, 2);
       var blob = new Blob([text], { type: "application/json" });
       var a = document.createElement("a");
-      a.download = tr(
-        "ui.elemOverrides.exportName",
-        "scigentem_overrides.json",
-      );
+      a.download = tr("ui.elemOverrides.exportName", "scigentem_overrides.json");
       a.href = URL.createObjectURL(blob);
       a.click();
       setTimeout(function () {
@@ -1835,8 +2088,7 @@ export async function interactive_em_image(smiles_text, _unused) {
   function importOverridesFromObject(obj) {
     if (!obj || typeof obj !== "object") return;
 
-    var raw =
-      obj.overrides && typeof obj.overrides === "object" ? obj.overrides : null;
+    var raw = obj.overrides && typeof obj.overrides === "object" ? obj.overrides : null;
     if (!raw) return;
 
     // Merge into elementOverrides (keep unknown elements; UI shows only current ones)
@@ -1851,8 +2103,7 @@ export async function interactive_em_image(smiles_text, _unused) {
       if (it.size != null) sz = clampMul(it.size, 0.2, null);
       if (it.dark != null) dk = clampMul(it.dark, 0.2, null);
 
-      if (!elementOverrides[sym])
-        elementOverrides[sym] = { size: 1.0, dark: 1.0 };
+      if (!elementOverrides[sym]) elementOverrides[sym] = { size: 1.0, dark: 1.0 };
       elementOverrides[sym].size = sz;
       elementOverrides[sym].dark = dk;
     }
@@ -1906,14 +2157,9 @@ export async function interactive_em_image(smiles_text, _unused) {
   }
   if (fileElemOvImport) {
     fileElemOvImport.addEventListener("change", async function () {
-      var f =
-        fileElemOvImport.files && fileElemOvImport.files.length
-          ? fileElemOvImport.files[0]
-          : null;
+      var f = fileElemOvImport.files && fileElemOvImport.files.length ? fileElemOvImport.files[0] : null;
       // reset input so same file can be re-imported
-      try {
-        fileElemOvImport.value = "";
-      } catch (e0) {}
+      try { fileElemOvImport.value = ""; } catch (e0) {}
 
       if (!f) return;
 
@@ -1925,6 +2171,7 @@ export async function interactive_em_image(smiles_text, _unused) {
       }
     });
   }
+
 
   // GIF controls
   if (btnGifStart) {
@@ -2047,9 +2294,7 @@ export async function interactive_em_image(smiles_text, _unused) {
       updateGifUI();
       updateModeDescText();
       updateBondsLabelText();
-      try {
-        rebuildElementOverridesTable(_elemList || []);
-      } catch (e) {}
+      try { rebuildElementOverridesTable(_elemList || []); } catch (e) {}
     });
   } catch (e) {}
 

@@ -322,7 +322,7 @@
       .tem_controls {
         grid-area: controls;
         overflow-y: auto;
-        max-height: 100vh;
+        max-height: calc(100vh - 210px);
         padding-right: 10px;
       }
 
@@ -337,11 +337,9 @@
       }
 
       #canvas {
-        width: auto;
+        width: 100%;
         height: auto;
-        max-width: 100%;
         max-height: calc(100vh - 300px);
-        display: block;
       }
 
       .header_help_row {

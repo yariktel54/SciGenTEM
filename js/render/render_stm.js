@@ -196,15 +196,22 @@ const _EO_Z2SYM = [
 
 function _EO_atomSymbol(a) {
   if (!a) return null;
+
+  // Prefer atomic number -> symbol (SMILES/RDKit can mis-populate .sym)
+  let Z = a.Z;
+  if (!Number.isFinite(Z)) Z = parseInt(Z, 10);
+  if (Number.isFinite(Z)) {
+    const zi = Z | 0;
+    if (zi > 0 && zi < _EO_Z2SYM.length) {
+      const zs = _EO_Z2SYM[zi];
+      if (zs) return zs;
+    }
+  }
+
   let s = a.sym || a.el || a.symbol || a.element;
   if (typeof s === "string") {
     s = s.trim();
     if (s) return s;
-  }
-  const Z = a.Z;
-  if (Number.isFinite(Z)) {
-    const zi = Z | 0;
-    if (zi > 0 && zi < _EO_Z2SYM.length) return _EO_Z2SYM[zi] || null;
   }
   return null;
 }
@@ -282,6 +289,8 @@ export function render_stm_like(atoms, opts = {}) {
     // We'll build into sig.a (Float32), background 0.
     const sig = newFloatImage(H, W, 0);
     const sigA = sig.a;
+    const darkField = new Float32Array(H * W);
+    let hasDarkOverride = false;
 
     // Internal STM tuning (no UI changes required)
     // z falloff: larger alpha -> more surface-like
@@ -329,9 +338,10 @@ export function render_stm_like(atoms, opts = {}) {
         // 2D gaussian size (px): scaled covalent radius, but slightly smaller than TEM
         const rA = radiiA[i];
 
-        // Per-element overrides (STM: apply size only)
+        // Per-element overrides
         const sym = _EO_atomSymbol(atoms[i]);
-        const [sizeMul, _darkMul] = _EO_getMul(ov, sym);
+        const [sizeMul, darkMul] = _EO_getMul(ov, sym);
+        if (Math.abs(darkMul - 1.0) > 1e-9) hasDarkOverride = true;
         let sigma = Math.max(1e-6, Math.pow(Math.max(1e-6, rA), stm_sigma_exp) * scale * stm_sigma_mul);
         sigma *= sizeMul;
         // keep a small minimum so distant zoom doesn't disappear completely
@@ -349,6 +359,29 @@ export function render_stm_like(atoms, opts = {}) {
         if (amp < 1e-6) continue;
 
         addGaussianROI(sigA, H, W, x0, y0, sigma, amp);
+
+        if (Math.abs(darkMul - 1.0) > 1e-9) {
+            const R = Math.ceil(4 * sigma);
+            const x0i = Math.floor(x0);
+            const y0i = Math.floor(y0);
+            const fracX = x0 - x0i;
+            const fracY = y0 - y0i;
+            const wx = getGaussian1D_cached(sigma, fracX, R);
+            const wy = getGaussian1D_cached(sigma, fracY, R);
+            const yStart = Math.max(0, y0i - R);
+            const yEnd = Math.min(H - 1, y0i + R);
+            const xStart = Math.max(0, x0i - R);
+            const xEnd = Math.min(W - 1, x0i + R);
+            for (let y = yStart; y <= yEnd; y++) {
+                const wyv = wy[(y - y0i) + R];
+                const row = y * W;
+                for (let x = xStart; x <= xEnd; x++) {
+                    const g = wx[(x - x0i) + R] * wyv;
+                    if (g <= 1e-6) continue;
+                    darkField[row + x] += (darkMul - 1.0) * g;
+                }
+            }
+        }
     }
 
     // Compress dynamic range a bit (fast, stable)
@@ -422,6 +455,17 @@ export function render_stm_like(atoms, opts = {}) {
     const img = newFloatImage(H, W, background_gray);
     for (let p = 0; p < img.a.length; p++) {
         img.a[p] = background_gray - (stm_signal_strength * sigA[p]);
+    }
+
+    // Apply local darkness AFTER normalization so the override changes tone,
+    // not the global max/focus balance.
+    if (hasDarkOverride) {
+        for (let p = 0; p < img.a.length; p++) {
+            let localDark = 1.0 + darkField[p];
+            if (localDark < 0.05) localDark = 0.05;
+            const d = background_gray - img.a[p];
+            img.a[p] = background_gray - d * localDark;
+        }
     }
 
     // Postprocess (matches TEM order)
