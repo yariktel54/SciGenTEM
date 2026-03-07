@@ -1,15 +1,14 @@
 // js/render/render_stm.js
-// Wave 3: realistic STM-like visualization with true scanlines/drift
+// STM-like surface render rebuilt on top of AFM-style envelope logic.
 //
-// Rules:
+// Design intent:
+//  - STM must stay surface-sensitive (not volume / x-ray-like)
+//  - apparent contrast should follow the top accessible electronic envelope,
+//    not a sum through the full thickness
+//  - atoms should appear as localized protrusions / lobes on the surface,
+//    not as literal TEM projected columns
 //  - bonds are NOT drawn in STM mode
-//  - DoF is ignored (surface mode)
-//  - hide_front + focal_z act as a "slice": if hide_front==true, atoms with z > focal_z are excluded
-//
-// Implementation notes:
-//  - Base signal is a fast "current map": sum of 2D Gaussians with strong exponential falloff by z
-//  - Optional scanline block adds: per-row DC offset, per-row gain, low-frequency banding, and gentle x-drift per row
-//  - Postprocess matches TEM/AFM pipeline: blur/noise/contrast/invert/clipping + grayscale->RGBA
+//  - DoF is ignored in STM mode; hide_front/focal_z may still act as an educational slice
 
 import { get_covalent_radius } from '../bonds/bonds.js';
 import {
@@ -25,7 +24,6 @@ import {
 // Helpers
 // ---------------------------
 
-// Fast randn (Box–Muller with cache)
 let _randn_spare = null;
 function randn() {
     if (_randn_spare != null) {
@@ -34,7 +32,6 @@ function randn() {
         return v;
     }
     let u1 = 0, u2 = 0;
-    // avoid log(0)
     while (u1 === 0) u1 = Math.random();
     u2 = Math.random();
     const r = Math.sqrt(-2.0 * Math.log(u1));
@@ -102,8 +99,6 @@ function randomWalk1D(n, stepSigma = 1.0) {
     return out;
 }
 
-// Shift one row by dx (subpixel) with linear interpolation.
-// dx > 0 shifts features to the right.
 function shiftRowLinear(src, srcOff, dst, w, dx) {
     if (!dx) {
         for (let x = 0; x < w; x++) dst[x] = src[srcOff + x];
@@ -121,48 +116,108 @@ function shiftRowLinear(src, srcOff, dst, w, dx) {
     }
 }
 
-// Add a positive 2D Gaussian bump into sig (Float32Array) using cached 1D weights.
-// (ROI-based, so O(N * R^2), not O(N*W*H).)
-function addGaussianROI(sigA, H, W, x0, y0, sigma, amp) {
-    if (!(sigma > 1e-9) || amp === 0) return;
+function buildPeakOnlyEdge(height, H, W) {
+    const edge = new Float32Array(H * W);
+    let emax = 0.0;
+    if (H >= 3 && W >= 3) {
+        for (let y = 1; y < H - 1; y++) {
+            const row = y * W;
+            for (let x = 1; x < W - 1; x++) {
+                const p = row + x;
+                const c = height[p];
+                const lap =
+                    4.0 * c -
+                    height[p - 1] -
+                    height[p + 1] -
+                    height[p - W] -
+                    height[p + W];
 
-    const x0i = Math.floor(x0);
-    const y0i = Math.floor(y0);
-    const fracX = x0 - x0i;
-    const fracY = y0 - y0i;
-
-    const R = Math.ceil(5 * sigma);
-
-    // fully outside
-    if ((x0 + R) < 0 || (x0 - R) >= W || (y0 + R) < 0 || (y0 - R) >= H) return;
-
-    const wx = getGaussian1D_cached(sigma, fracX, R);
-    const wy = getGaussian1D_cached(sigma, fracY, R);
-
-    const yStart = Math.max(0, (y0i - R));
-    const yEnd   = Math.min(H - 1, (y0i + R));
-    const xStart = Math.max(0, (x0i - R));
-    const xEnd   = Math.min(W - 1, (x0i + R));
-
-    for (let y = yStart; y <= yEnd; y++) {
-        const wyv = wy[(y - y0i) + R];
-        const row = y * W;
-        for (let x = xStart; x <= xEnd; x++) {
-            sigA[row + x] += amp * (wx[(x - x0i) + R] * wyv);
+                let v = 0.0;
+                if (lap > 0.0) {
+                    const cL = height[p - 1];
+                    const cR = height[p + 1];
+                    const cU = height[p - W];
+                    const cD = height[p + W];
+                    const isPeak = (c >= cL && c >= cR && c >= cU && c >= cD);
+                    if (isPeak) v = lap;
+                }
+                edge[p] = v;
+                if (v > emax) emax = v;
+            }
         }
     }
+    if (emax > 1e-12) {
+        const inv = 1.0 / emax;
+        for (let p = 0; p < edge.length; p++) edge[p] *= inv;
+    }
+    return edge;
 }
 
-// Read scanlines checkbox robustly from opts (UI uses id "cb-scanlines").
+function normalizeField(field) {
+    let fmax = 0.0;
+    for (let i = 0; i < field.length; i++) if (field[i] > fmax) fmax = field[i];
+    if (fmax > 1e-12) {
+        const inv = 1.0 / fmax;
+        for (let i = 0; i < field.length; i++) field[i] *= inv;
+    }
+    return field;
+}
+
+function applyScanlineArtifacts(sigA, H, W, opts) {
+    const scan_off_amp = (opts.stm_scan_off_amp != null) ? Number(opts.stm_scan_off_amp) : 0.018;
+    const scan_gain_amp = (opts.stm_scan_gain_amp != null) ? Number(opts.stm_scan_gain_amp) : 0.055;
+    const scan_band_amp = (opts.stm_scan_band_amp != null) ? Number(opts.stm_scan_band_amp) : 0.015;
+    const scan_drift_amp_px = (opts.stm_scan_drift_amp_px != null) ? Number(opts.stm_scan_drift_amp_px) : 0.95;
+    const scan_smooth_sigma = (opts.stm_scan_smooth_sigma != null) ? Number(opts.stm_scan_smooth_sigma) : 10.0;
+
+    let off = randomWalk1D(H, 1.0);
+    let gain = randomWalk1D(H, 1.0);
+    let dx = randomWalk1D(H, 1.0);
+
+    gaussianSmooth1D_inplace(off, scan_smooth_sigma);
+    gaussianSmooth1D_inplace(gain, scan_smooth_sigma);
+    gaussianSmooth1D_inplace(dx, scan_smooth_sigma);
+
+    normalizeStdInPlace(off);
+    normalizeStdInPlace(gain);
+    normalizeStdInPlace(dx);
+
+    for (let y = 0; y < H; y++) {
+        off[y] *= scan_off_amp;
+        gain[y] *= scan_gain_amp;
+        dx[y] *= scan_drift_amp_px;
+    }
+
+    const per1 = Math.max(24, Math.round(H * 0.42));
+    const per2 = Math.max(36, Math.round(H * 0.73));
+    const phi = Math.random() * Math.PI * 2;
+
+    const rowBuf = new Float32Array(W);
+    for (let y = 0; y < H; y++) {
+        const band = scan_band_amp * (
+            Math.sin((2 * Math.PI * y) / per1 + phi) +
+            0.45 * Math.sin((2 * Math.PI * y) / per2 + 1.7 * phi)
+        );
+
+        const rowOff = y * W;
+        shiftRowLinear(sigA, rowOff, rowBuf, W, dx[y]);
+
+        const g = 1.0 + gain[y];
+        const o = off[y] + band;
+        for (let x = 0; x < W; x++) {
+            let v = rowBuf[x] * g + o;
+            if (v < 0) v = 0;
+            sigA[rowOff + x] = v;
+        }
+    }
+
+    normalizeField(sigA);
+}
+
 function getScanlinesFlag(opts) {
     if (!opts) return false;
-
-    // common naming patterns
-    const direct =
-        (opts.cb_scanlines ?? opts.cbScanlines ?? opts.scanlines_flag ?? opts.scanlines ?? opts.enable_scanlines);
+    const direct = (opts.cb_scanlines ?? opts.cbScanlines ?? opts.scanlines_flag ?? opts.scanlines ?? opts.enable_scanlines);
     if (typeof direct === 'boolean') return direct;
-
-    // sometimes UI values are nested
     const ui = opts.ui || opts.controls || opts.flags || null;
     if (ui) {
         const v = (ui.cb_scanlines ?? ui.cbScanlines ?? ui.scanlines_flag ?? ui.scanlines ?? ui.enable_scanlines);
@@ -170,11 +225,6 @@ function getScanlinesFlag(opts) {
     }
     return false;
 }
-
-// ---------------------------
-// Main: STM render
-// ---------------------------
-
 
 // Element overrides helper (Z->symbol fallback)
 const _EO_Z2SYM = [
@@ -196,8 +246,6 @@ const _EO_Z2SYM = [
 
 function _EO_atomSymbol(a) {
   if (!a) return null;
-
-  // Prefer atomic number -> symbol (SMILES/RDKit can mis-populate .sym)
   let Z = a.Z;
   if (!Number.isFinite(Z)) Z = parseInt(Z, 10);
   if (Number.isFinite(Z)) {
@@ -207,7 +255,6 @@ function _EO_atomSymbol(a) {
       if (zs) return zs;
     }
   }
-
   let s = a.sym || a.el || a.symbol || a.element;
   if (typeof s === "string") {
     s = s.trim();
@@ -227,8 +274,199 @@ function _EO_getMul(ov, sym) {
   return [sizeMul, darkMul];
 }
 
+function estimateStmGeom(atom, scale, ov, opts) {
+    const Z = Math.max(1, atom?.Z | 0);
+    const rA = get_covalent_radius(Z);
+    const sym = _EO_atomSymbol(atom);
+    const [sizeMul, darkMul] = _EO_getMul(ov, sym);
+
+    const sigmaMul = (opts.stm_sigma_mul != null) ? Number(opts.stm_sigma_mul) : 0.95;
+    const sigmaExp = (opts.stm_sigma_exp != null) ? Number(opts.stm_sigma_exp) : 1.10;
+    const typicalBondA = opts.typical_bond_A ?? 1.40;
+    const capRelBond = opts.stm_sigma_cap_rel_bond ?? 0.50;
+    const capAbsPx = opts.stm_sigma_cap_abs_px ?? 20.0;
+
+    let sigma = Math.max(1e-6, Math.pow(Math.max(1e-6, rA), sigmaExp) * scale * sigmaMul);
+    sigma *= sizeMul;
+    if (sigma < 0.45) sigma = 0.45;
+
+    const capPx = Math.min(capAbsPx, Math.max(1.0, capRelBond * typicalBondA * scale));
+    if (sigma > capPx) sigma = capPx;
+
+    return { sigma, sizeMul, darkMul, rA, Z };
+}
+
+function buildSurfaceSubset(atoms, coords, z_view, scale, ov, opts, H, W) {
+    const cellPx = Math.max(2.0, Number(opts.stm_surface_cell_px ?? 4.0));
+    const gridW = Math.max(1, Math.ceil(W / cellPx));
+    const gridH = Math.max(1, Math.ceil(H / cellPx));
+    const topZ = new Float32Array(gridW * gridH);
+    const NEG = -1e30;
+    for (let i = 0; i < topZ.length; i++) topZ[i] = NEG;
+
+    const footprintMul = Math.max(0.75, Number(opts.stm_surface_footprint_mul ?? 1.20));
+    const envelopeA = Math.max(0.0, Number(opts.stm_surface_envelope_A ?? 0.70));
+    const padPx = 0.5 * cellPx;
+    const candidates = [];
+
+    function cellCoverLoop(x0, y0, radiusPx, fn) {
+        const gx0 = Math.max(0, Math.floor((x0 - radiusPx) / cellPx));
+        const gx1 = Math.min(gridW - 1, Math.floor((x0 + radiusPx) / cellPx));
+        const gy0 = Math.max(0, Math.floor((y0 - radiusPx) / cellPx));
+        const gy1 = Math.min(gridH - 1, Math.floor((y0 + radiusPx) / cellPx));
+        const rr = radiusPx + padPx;
+        const rr2 = rr * rr;
+
+        for (let gy = gy0; gy <= gy1; gy++) {
+            const cy = (gy + 0.5) * cellPx;
+            for (let gx = gx0; gx <= gx1; gx++) {
+                const cx = (gx + 0.5) * cellPx;
+                const dx = cx - x0;
+                const dy = cy - y0;
+                if ((dx * dx + dy * dy) > rr2) continue;
+                fn(gx, gy);
+            }
+        }
+    }
+
+    for (let i = 0; i < atoms.length; i++) {
+        const p = coords[i];
+        if (!p) continue;
+        const x0 = p[0];
+        const y0 = p[1];
+        const zAtom = z_view ? (z_view[i] ?? 0) : (atoms[i].z ?? 0);
+        if (opts.hide_front && zAtom > opts.focal_z + 1e-9) continue;
+
+        const geom = estimateStmGeom(atoms[i], scale, ov, opts);
+        const surfaceRadiusPx = Math.max(cellPx * 0.8, geom.sigma * footprintMul);
+        if ((x0 + surfaceRadiusPx) < 0 || (x0 - surfaceRadiusPx) >= W || (y0 + surfaceRadiusPx) < 0 || (y0 - surfaceRadiusPx) >= H) continue;
+
+        const cand = {
+            index: i,
+            x0,
+            y0,
+            z: zAtom,
+            sigma: geom.sigma,
+            sizeMul: geom.sizeMul,
+            darkMul: geom.darkMul,
+            Z: geom.Z,
+            rA: geom.rA,
+            surfaceRadiusPx,
+            localTopZ: zAtom,
+            surfaceGapA: Infinity,
+            selected: false,
+        };
+        candidates.push(cand);
+
+        cellCoverLoop(x0, y0, surfaceRadiusPx, function (gx, gy) {
+            const gi = gy * gridW + gx;
+            if (zAtom > topZ[gi]) topZ[gi] = zAtom;
+        });
+    }
+
+    if (!candidates.length) return [];
+
+    for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        let localTop = NEG;
+        let minGap = Infinity;
+        cellCoverLoop(cand.x0, cand.y0, cand.surfaceRadiusPx, function (gx, gy) {
+            const zTop = topZ[gy * gridW + gx];
+            if (zTop <= NEG * 0.5) return;
+            if (zTop > localTop) localTop = zTop;
+            const gap = zTop - cand.z;
+            if (gap < minGap) minGap = gap;
+            if (gap <= envelopeA + 1e-9) cand.selected = true;
+        });
+
+        if (localTop > NEG * 0.5) cand.localTopZ = localTop;
+        if (Number.isFinite(minGap)) cand.surfaceGapA = Math.max(0.0, minGap);
+    }
+
+    let anySelected = false;
+    for (let i = 0; i < candidates.length; i++) {
+        if (candidates[i].selected) {
+            anySelected = true;
+            break;
+        }
+    }
+    if (!anySelected) {
+        let best = 0;
+        for (let i = 1; i < candidates.length; i++) {
+            if (candidates[i].z > candidates[best].z) best = i;
+        }
+        candidates[best].selected = true;
+        candidates[best].surfaceGapA = 0.0;
+        candidates[best].localTopZ = candidates[best].z;
+    }
+
+    const out = [];
+    for (let i = 0; i < candidates.length; i++) {
+        if (candidates[i].selected) out.push(candidates[i]);
+    }
+    return out;
+}
+
+function depositMaxGaussian(field, H, W, x0, y0, sigma, amp) {
+    if (!(sigma > 1e-9) || !(amp > 0)) return;
+
+    const x0i = Math.floor(x0);
+    const y0i = Math.floor(y0);
+    const fracX = x0 - x0i;
+    const fracY = y0 - y0i;
+    const R = Math.ceil(4 * sigma);
+
+    if ((x0 + R) < 0 || (x0 - R) >= W || (y0 + R) < 0 || (y0 - R) >= H) return;
+
+    const wx = getGaussian1D_cached(sigma, fracX, R);
+    const wy = getGaussian1D_cached(sigma, fracY, R);
+
+    const yStart = Math.max(0, y0i - R);
+    const yEnd = Math.min(H - 1, y0i + R);
+    const xStart = Math.max(0, x0i - R);
+    const xEnd = Math.min(W - 1, x0i + R);
+
+    for (let y = yStart; y <= yEnd; y++) {
+        const wyv = wy[(y - y0i) + R];
+        const row = y * W;
+        for (let x = xStart; x <= xEnd; x++) {
+            const v = amp * (wx[(x - x0i) + R] * wyv);
+            const p = row + x;
+            if (v > field[p]) field[p] = v;
+        }
+    }
+}
+
+function accumulateGaussian(field, H, W, x0, y0, sigma, amp) {
+    if (!(sigma > 1e-9) || !(amp !== 0)) return;
+
+    const x0i = Math.floor(x0);
+    const y0i = Math.floor(y0);
+    const fracX = x0 - x0i;
+    const fracY = y0 - y0i;
+    const R = Math.ceil(4 * sigma);
+
+    if ((x0 + R) < 0 || (x0 - R) >= W || (y0 + R) < 0 || (y0 - R) >= H) return;
+
+    const wx = getGaussian1D_cached(sigma, fracX, R);
+    const wy = getGaussian1D_cached(sigma, fracY, R);
+
+    const yStart = Math.max(0, y0i - R);
+    const yEnd = Math.min(H - 1, y0i + R);
+    const xStart = Math.max(0, x0i - R);
+    const xEnd = Math.min(W - 1, x0i + R);
+
+    for (let y = yStart; y <= yEnd; y++) {
+        const wyv = wy[(y - y0i) + R];
+        const row = y * W;
+        for (let x = xStart; x <= xEnd; x++) {
+            field[row + x] += amp * (wx[(x - x0i) + R] * wyv);
+        }
+    }
+}
+
 export function render_stm_like(atoms, opts = {}) {
-  const ov = opts?.element_overrides || null;
+    const ov = opts?.element_overrides || null;
     const {
         img_size = [400, 400],
         angstroms_per_pixel = 0.1,
@@ -238,27 +476,17 @@ export function render_stm_like(atoms, opts = {}) {
         noise_stddev = 2.0,
         contrast = 1.0,
         camera = null,
-
-        // clipping
         low_clip = null,
         high_clip = null,
-
-        // "slice" controls (education depth)
         focal_z = 0.0,
         hide_front = false,
-
-        // scale bar (optional, same pattern as TEM)
         show_scale_bar = false,
         scale_bar_corner = 'bl',
         scale_bar_margin_px = 12,
-
-        // canvas ctx (optional)
         canvasCtx = null
     } = opts;
 
     const [H, W] = img_size;
-
-    // If empty, still clear canvas to background.
     if (!atoms || !atoms.length) {
         const out0 = new Uint8ClampedArray(H * W);
         out0.fill(clamp255(background_gray));
@@ -284,198 +512,107 @@ export function render_stm_like(atoms, opts = {}) {
     }
 
     const [coords, scale, z_view] = compute_scaled_coordinates(atoms, img_size, angstroms_per_pixel, camera);
+    const surfaceAtoms = buildSurfaceSubset(atoms, coords, z_view, scale, ov, {
+        ...opts,
+        focal_z,
+        hide_front,
+    }, H, W);
 
-    // Base STM "current map" signal (positive float image)
-    // We'll build into sig.a (Float32), background 0.
-    const sig = newFloatImage(H, W, 0);
-    const sigA = sig.a;
+    const height = new Float32Array(H * W);
+    const center = new Float32Array(H * W);
     const darkField = new Float32Array(H * W);
     let hasDarkOverride = false;
 
-    // Internal STM tuning (no UI changes required)
-    // z falloff: larger alpha -> more surface-like
-    const stm_alpha = (opts.stm_alpha != null) ? Number(opts.stm_alpha) : 2.8; // 1/Å
-    const stm_sigma_mul = (opts.stm_sigma_mul != null) ? Number(opts.stm_sigma_mul) : 0.75;
-    const stm_sigma_exp = (opts.stm_sigma_exp != null) ? Number(opts.stm_sigma_exp) : 1.05;
+    let topSurfaceZ = -Infinity;
+    for (let i = 0; i < surfaceAtoms.length; i++) {
+        if (surfaceAtoms[i].localTopZ > topSurfaceZ) topSurfaceZ = surfaceAtoms[i].localTopZ;
+    }
+    if (!Number.isFinite(topSurfaceZ)) topSurfaceZ = 0.0;
 
-    // signal strength (maps normalized sig -> pixel delta)
-    const stm_signal_strength = (opts.stm_signal_strength != null) ? Number(opts.stm_signal_strength) : 190.0;
+    const stm_surface_alpha = (opts.stm_surface_alpha != null) ? Number(opts.stm_surface_alpha) : 3.6;
+    const stm_global_alpha = (opts.stm_global_alpha != null) ? Number(opts.stm_global_alpha) : 0.28;
+    const stm_surface_floor = (opts.stm_surface_floor != null) ? Number(opts.stm_surface_floor) : 0.55;
+    const stm_terrace_floor = (opts.stm_terrace_floor != null) ? Number(opts.stm_terrace_floor) : 0.45;
+    const stm_center_sigma_mul = (opts.stm_center_sigma_mul != null) ? Number(opts.stm_center_sigma_mul) : 0.52;
 
-    // scanline amps (in normalized signal units)
-    const scan_off_amp = (opts.stm_scan_off_amp != null) ? Number(opts.stm_scan_off_amp) : 0.020;
-    const scan_gain_amp = (opts.stm_scan_gain_amp != null) ? Number(opts.stm_scan_gain_amp) : 0.060;
-    const scan_band_amp = (opts.stm_scan_band_amp != null) ? Number(opts.stm_scan_band_amp) : 0.016;
-    const scan_drift_amp_px = (opts.stm_scan_drift_amp_px != null) ? Number(opts.stm_scan_drift_amp_px) : 1.10;
+    for (let i = 0; i < surfaceAtoms.length; i++) {
+        const s = surfaceAtoms[i];
+        const zGapLocal = Math.max(0.0, s.surfaceGapA);
+        const zGapGlobal = Math.max(0.0, topSurfaceZ - s.z);
 
-    // slow-variation smoothing (in rows)
-    const scan_smooth_sigma = (opts.stm_scan_smooth_sigma != null) ? Number(opts.stm_scan_smooth_sigma) : 10.0;
+        const wSurfaceRaw = Math.exp(-stm_surface_alpha * zGapLocal);
+        const wTerraceRaw = Math.exp(-stm_global_alpha * zGapGlobal);
+        const wSurface = stm_surface_floor + (1.0 - stm_surface_floor) * wSurfaceRaw;
+        const wTerrace = stm_terrace_floor + (1.0 - stm_terrace_floor) * wTerraceRaw;
+        const w = wSurface * wTerrace;
+        if (w < 1e-5) continue;
 
-    // Build signal: per-atom ROI Gaussians with z-dependent weights.
-    // NOTE: bonds disabled by design.
-    const Zs = atoms.map(a => a.Z | 0);
-    const radiiA = Zs.map(Z => get_covalent_radius(Z));
+        // STM apparent contrast should not follow a hard-coded monotonic atomic-number law.
+        // In the simplified surface model we keep visibility mostly geometric/surface-driven;
+        // per-element contrast can still be adjusted via element overrides if needed.
+        const geomAmp = 0.82 * w;
+        const centerAmp = 0.98 * w;
 
-    const typical_bond_A = opts.typical_bond_A ?? 1.40;
-    const cap_rel_bond = opts.stm_sigma_cap_rel_bond ?? 0.45;
-    const cap_abs_px = opts.stm_sigma_cap_abs_px ?? 18.0;
+        depositMaxGaussian(height, H, W, s.x0, s.y0, s.sigma, geomAmp);
+        depositMaxGaussian(center, H, W, s.x0, s.y0, Math.max(0.35, s.sigma * stm_center_sigma_mul), centerAmp);
 
-    for (let i = 0; i < atoms.length; i++) {
-        const p = coords[i];
-        if (!p) continue;
-
-        const x0 = p[0];
-        const y0 = p[1];
-
-        const zAtom = (z_view ? (z_view[i] ?? 0) : (atoms[i].z ?? 0));
-        if (hide_front && (zAtom > focal_z + 1e-9)) continue;
-
-        // z-dependent weight (surface-like):
-        //  - if hide_front: only atoms behind focal plane remain; deeper atoms contribute less
-        //  - else: symmetric falloff around focal_z
-        const dz = hide_front ? Math.max(0, (focal_z - zAtom)) : Math.abs(zAtom - focal_z);
-        const wZ = Math.exp(-stm_alpha * dz);
-
-        // 2D gaussian size (px): scaled covalent radius, but slightly smaller than TEM
-        const rA = radiiA[i];
-
-        // Per-element overrides
-        const sym = _EO_atomSymbol(atoms[i]);
-        const [sizeMul, darkMul] = _EO_getMul(ov, sym);
-        if (Math.abs(darkMul - 1.0) > 1e-9) hasDarkOverride = true;
-        let sigma = Math.max(1e-6, Math.pow(Math.max(1e-6, rA), stm_sigma_exp) * scale * stm_sigma_mul);
-        sigma *= sizeMul;
-        // keep a small minimum so distant zoom doesn't disappear completely
-        if (sigma < 0.35) sigma = 0.35;
-
-        // LOD cap to avoid huge blobs on heavy atoms / dense crystals
-        const cap_px = Math.min(cap_abs_px, Math.max(1.0, cap_rel_bond * typical_bond_A * scale));
-        if (sigma > cap_px) sigma = cap_px;
-
-        // amplitude: weak Z dependence (STM is not pure Z, but gives variety)
-        const Z = Math.max(1, Zs[i]);
-        const aZ = Math.pow(Z, 0.35);
-
-        const amp = wZ * aZ;
-        if (amp < 1e-6) continue;
-
-        addGaussianROI(sigA, H, W, x0, y0, sigma, amp);
-
-        if (Math.abs(darkMul - 1.0) > 1e-9) {
-            const R = Math.ceil(4 * sigma);
-            const x0i = Math.floor(x0);
-            const y0i = Math.floor(y0);
-            const fracX = x0 - x0i;
-            const fracY = y0 - y0i;
-            const wx = getGaussian1D_cached(sigma, fracX, R);
-            const wy = getGaussian1D_cached(sigma, fracY, R);
-            const yStart = Math.max(0, y0i - R);
-            const yEnd = Math.min(H - 1, y0i + R);
-            const xStart = Math.max(0, x0i - R);
-            const xEnd = Math.min(W - 1, x0i + R);
-            for (let y = yStart; y <= yEnd; y++) {
-                const wyv = wy[(y - y0i) + R];
-                const row = y * W;
-                for (let x = xStart; x <= xEnd; x++) {
-                    const g = wx[(x - x0i) + R] * wyv;
-                    if (g <= 1e-6) continue;
-                    darkField[row + x] += (darkMul - 1.0) * g;
-                }
-            }
+        if (Math.abs(s.darkMul - 1.0) > 1e-9) {
+            hasDarkOverride = true;
+            accumulateGaussian(darkField, H, W, s.x0, s.y0, s.sigma, (s.darkMul - 1.0));
         }
     }
 
-    // Compress dynamic range a bit (fast, stable)
-    for (let p = 0; p < sigA.length; p++) sigA[p] = Math.sqrt(sigA[p]);
+    normalizeField(height);
+    normalizeField(center);
+    const edge = buildPeakOnlyEdge(height, H, W);
 
-    // Normalize signal to ~[0..1]
-    let maxSig = 0;
-    for (let p = 0; p < sigA.length; p++) if (sigA[p] > maxSig) maxSig = sigA[p];
-    const invMax = 1.0 / Math.max(1e-9, maxSig);
-    for (let p = 0; p < sigA.length; p++) sigA[p] *= invMax;
+    // STM apparent contrast: broad surface envelope + localized electronic apex.
+    // Kept on AFM-like max/envelope semantics, but without AFM bond/topography styling.
+    const sig = newFloatImage(H, W, 0);
+    const sigA = sig.a;
+    const Kheight = (opts.stm_k_height != null) ? Number(opts.stm_k_height) : 0.72;
+    const Kcenter = (opts.stm_k_center != null) ? Number(opts.stm_k_center) : 0.68;
+    const Kedge = (opts.stm_k_edge != null) ? Number(opts.stm_k_edge) : 0.16;
 
-    // Optional scanline block (true row artifacts + gentle drift)
-    const scanlines_on = getScanlinesFlag(opts);
-    if (scanlines_on) {
-        // per-row offsets / gains / drift (low-frequency via smooth random walk)
-        let off = randomWalk1D(H, 1.0);
-        let gain = randomWalk1D(H, 1.0);
-        let dx = randomWalk1D(H, 1.0);
+    for (let p = 0; p < sigA.length; p++) {
+        sigA[p] = Kheight * height[p] + Kcenter * center[p] + Kedge * edge[p];
+    }
+    normalizeField(sigA);
 
-        gaussianSmooth1D_inplace(off, scan_smooth_sigma);
-        gaussianSmooth1D_inplace(gain, scan_smooth_sigma);
-        gaussianSmooth1D_inplace(dx, scan_smooth_sigma);
-
-        normalizeStdInPlace(off);
-        normalizeStdInPlace(gain);
-        normalizeStdInPlace(dx);
-
-        for (let y = 0; y < H; y++) {
-            off[y] *= scan_off_amp;
-            gain[y] *= scan_gain_amp;
-            dx[y] *= scan_drift_amp_px;
+    const stm_mid_gamma = (opts.stm_mid_gamma != null) ? Number(opts.stm_mid_gamma) : 0.72;
+    if (stm_mid_gamma > 0 && Math.abs(stm_mid_gamma - 1.0) > 1e-9) {
+        for (let p = 0; p < sigA.length; p++) {
+            const v = sigA[p];
+            sigA[p] = (v > 0) ? Math.pow(v, stm_mid_gamma) : 0;
         }
-
-        // low-frequency banding (slow wave over y)
-        const per1 = Math.max(24, Math.round(H * 0.42));
-        const per2 = Math.max(36, Math.round(H * 0.73));
-        const phi = Math.random() * Math.PI * 2;
-
-        const rowBuf = new Float32Array(W);
-        for (let y = 0; y < H; y++) {
-            const band = scan_band_amp * (
-                Math.sin((2 * Math.PI * y) / per1 + phi) +
-                0.45 * Math.sin((2 * Math.PI * y) / per2 + 1.7 * phi)
-            );
-
-            const rowOff = y * W;
-
-            // drift (subpixel row shift)
-            shiftRowLinear(sigA, rowOff, rowBuf, W, dx[y]);
-
-            // apply gain + offset + banding
-            const g = 1.0 + gain[y];
-            const o = off[y] + band;
-
-            for (let x = 0; x < W; x++) {
-                let v = rowBuf[x] * g + o;
-                if (v < 0) v = 0;
-                sigA[rowOff + x] = v;
-            }
-        }
-
-        // Keep within [0..1] again (after row mods)
-        let max2 = 0;
-        for (let p = 0; p < sigA.length; p++) if (sigA[p] > max2) max2 = sigA[p];
-        const inv2 = 1.0 / Math.max(1e-9, max2);
-        for (let p = 0; p < sigA.length; p++) sigA[p] *= inv2;
+        normalizeField(sigA);
     }
 
-    // Convert signal -> grayscale float image (img.a) with background reference.
-    // STM is typically displayed as bumps/holes on a background; we map signal into darkening.
+    if (getScanlinesFlag(opts)) {
+        applyScanlineArtifacts(sigA, H, W, opts);
+    }
+
+    const stm_signal_strength = (opts.stm_signal_strength != null) ? Number(opts.stm_signal_strength) : 212.0;
     const img = newFloatImage(H, W, background_gray);
     for (let p = 0; p < img.a.length; p++) {
         img.a[p] = background_gray - (stm_signal_strength * sigA[p]);
     }
 
-    // Apply local darkness AFTER normalization so the override changes tone,
-    // not the global max/focus balance.
     if (hasDarkOverride) {
         for (let p = 0; p < img.a.length; p++) {
-            let localDark = 1.0 + darkField[p];
+            let localDark = 1.0 + 0.20 * darkField[p];
             if (localDark < 0.05) localDark = 0.05;
             const d = background_gray - img.a[p];
             img.a[p] = background_gray - d * localDark;
         }
     }
 
-    // Postprocess (matches TEM order)
     const scratch = new Float32Array(H * W);
-
     if (blur_sigma > 0) gaussianBlurFloat(img, blur_sigma, scratch);
 
     if (noise_stddev > 0) {
-        const σ = noise_stddev;
-        for (let i = 0; i < img.a.length; i++) img.a[i] += randn() * σ;
+        const sigmaNoise = noise_stddev;
+        for (let i = 0; i < img.a.length; i++) img.a[i] += randn() * sigmaNoise;
     }
 
     if (contrast !== 1.0) {
@@ -501,11 +638,9 @@ export function render_stm_like(atoms, opts = {}) {
         }
     }
 
-    // to 8-bit
     const out = new Uint8ClampedArray(H * W);
     for (let i = 0; i < out.length; i++) out[i] = clamp255(img.a[i]);
 
-    // RENDER to canvas (grayscale -> RGBA)
     if (canvasCtx) {
         const imageData = canvasCtx.createImageData(W, H);
         for (let i = 0, p = 0; i < out.length; i++, p += 4) {
@@ -529,7 +664,6 @@ export function render_stm_like(atoms, opts = {}) {
     return out;
 }
 
-// Backward-compatible alias (some code may call render_image_stm)
 export function render_image_stm(atoms, opts = {}) {
     return render_stm_like(atoms, opts);
 }

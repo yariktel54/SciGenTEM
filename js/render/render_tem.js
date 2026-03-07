@@ -73,7 +73,7 @@ export function draw_atoms(img, atoms, coords, scale, background_gray, opts = {}
         hide_front = false
     } = opts;
 
-    // (compose/dof_strength поки не використовуються напряму — залишено для сумісності)
+    // compose/dof_strength лишаємо для сумісності API.
     void compose; void dof_strength;
 
     const Zs = atoms.map(a => a.Z | 0);
@@ -82,8 +82,13 @@ export function draw_atoms(img, atoms, coords, scale, background_gray, opts = {}
     // Element overrides (per-element multipliers)
     const ov = (opts && opts.element_overrides) ? opts.element_overrides : null;
 
-    // v3: 2D Gaussian як wx * wy (1D ваги по X/Y)
-    // v4: wx/wy беруться з кешу getGaussian1D_cached() (менше exp() + майже без алокацій)
+    // TEM тепер працює як projection-like accumulation:
+    //  - darkAccum: накопичена projected darkness / potential
+    //  - coreAccum: яскравий центр атома
+    // Потім усе мапиться назад у grayscale ОДНИМ проходом.
+    const darkAccum = new Float32Array(img.w * img.h);
+    const coreAccum = new Float32Array(img.w * img.h);
+    const accumK = opts.projected_accum_k ?? (1.0 / Math.max(1.0, background_gray));
 
     for (let i = 0; i < atoms.length; i++) {
         const x0 = coords[i][0];
@@ -96,58 +101,46 @@ export function draw_atoms(img, atoms, coords, scale, background_gray, opts = {}
         const [sizeMul, darkMul] = _EO_getMul(ov, sym);
 
         // Реалістична "геометрична" ширина атома: залежить від ковалентного радіуса
-        // atom_size_mul — загальний множник, atom_size_exp — підсилює різницю між H і важкими
-        const atom_size_mul = opts.atom_size_mul ?? 1.2;     // 0.6..1.6 (тюнінг)
-        const atom_size_exp = opts.atom_size_exp ?? 1.25;    // 1.0..1.5 (1.25 дає помітну різницю)
+        const atom_size_mul = opts.atom_size_mul ?? 1.2;
+        const atom_size_exp = opts.atom_size_exp ?? 1.25;
         const rA = radiiA[i];
 
-        // без "мінімумів": лише числовий захист від нуля
-        // + LOD-кап по масштабу, щоб важкі елементи/кристали не перетворювались на "чорну пляму"
-        //   (кап прив’язаний до типового bond-length у пікселях, а не до формату)
         let sigma = Math.max(1e-6, Math.pow(rA, atom_size_exp) * scale * atom_size_mul);
         sigma *= sizeMul;
-        const typical_bond_A = opts.typical_bond_A ?? 1.40;               // Å
-        const cap_rel_bond = opts.atom_sigma_cap_rel_bond ?? 0.55;        // частка від bondPx
-        const cap_abs_px = opts.atom_sigma_cap_abs_px ?? 24.0;            // абсолютний safety-cap
+        const typical_bond_A = opts.typical_bond_A ?? 1.40;
+        const cap_rel_bond = opts.atom_sigma_cap_rel_bond ?? 0.55;
+        const cap_abs_px = opts.atom_sigma_cap_abs_px ?? 24.0;
         const cap_px0 = Math.min(cap_abs_px, Math.max(1.5, cap_rel_bond * typical_bond_A * scale));
         const cap_px = cap_px0 * (Number.isFinite(sizeMul) ? sizeMul : 1.0);
         if (sigma > cap_px) sigma = cap_px;
 
-        // Інтенсивність
-        const atom_dark_mul = opts.atom_dark_mul ?? 2.5;   // 1.5..4.0
-        const atom_dark_exp = opts.atom_dark_exp ?? 1.2;   // 1.1..1.6
+        // projected darkness (накопичується по колоні)
+        const atom_dark_mul = opts.atom_dark_mul ?? 2.5;
+        const atom_dark_exp = opts.atom_dark_exp ?? 1.2;
         const baseZ = Math.pow(Zs[i], atom_dark_exp) * darkMul;
-        const intensity = -(baseZ * atom_dark_mul);
+        const darkStrength = Math.max(0.0, baseZ * atom_dark_mul);
 
         // «ядро»
-        const core_sigma_rel = opts.core_sigma_rel ?? 0.18; // 0.12..0.22
-        const core_rel = opts.core_rel ?? 0.6;             // 0.3..0.9
-        const core_Z0 = opts.core_Z0 ?? 12;                // 8..20
+        const core_sigma_rel = opts.core_sigma_rel ?? 0.18;
+        const core_rel = opts.core_rel ?? 0.6;
+        const core_Z0 = opts.core_Z0 ?? 12;
 
         const core_sigma = sigma * core_sigma_rel;
-
-        // приглушення ядра для великих Z
         const core_falloff = 1.0 / (1.0 + (Zs[i] / core_Z0) * (Zs[i] / core_Z0));
         const core_intensity = baseZ * core_rel * core_falloff;
 
-        // Опорна ціла точка (subpixel): t = x - floor(x0), frac = x0 - floor(x0)
-        // Це дозволяє рахувати 2D Gaussian як wx[t]*wy[u] без exp() у внутрішньому циклі.
         const x0i = Math.floor(x0);
         const y0i = Math.floor(y0);
         const fracX = x0 - x0i;
         const fracY = y0 - y0i;
 
-        // --- Gaussian "тіло" атома (subpixel) ---
+        // --- Gaussian body ---
         const R = Math.ceil(3 * sigma);
-
-        // v2: якщо атом повністю за кадром — пропускаємо весь атом
         if ((x0 + R) < 0 || (x0 - R) >= img.w || (y0 + R) < 0 || (y0 - R) >= img.h) continue;
 
-        // v3: 1D Gaussian ваги (subpixel)
         const wx = getGaussian1D_cached(sigma, fracX, R);
         const wy = getGaussian1D_cached(sigma, fracY, R);
 
-        // v2: обрізаємо межі обходу одразу (менше if у циклі)
         const yStart = Math.max(0, (y0i - R));
         const yEnd   = Math.min(img.h - 1, (y0i + R));
         const xStart = Math.max(0, (x0i - R));
@@ -155,21 +148,18 @@ export function draw_atoms(img, atoms, coords, scale, background_gray, opts = {}
 
         for (let y = yStart; y <= yEnd; y++) {
             const wyv = wy[(y - y0i) + R];
+            const row = y * img.w;
             for (let x = xStart; x <= xEnd; x++) {
-                const v = intensity * (wx[(x - x0i) + R] * wyv);
-                const p = (y * img.w + x);
-                const current = img.a[p];
-                const candidate = background_gray + v;
-                img.a[p] = Math.min(current, candidate);
+                const g = wx[(x - x0i) + R] * wyv;
+                if (g <= 1e-9) continue;
+                const p = row + x;
+                darkAccum[p] += darkStrength * g;
             }
         }
 
-        // --- «ядро» (яскравий центр) (subpixel) ---
+        // --- core (bright center) ---
         const Rc = Math.ceil(3 * core_sigma);
-
-        // v2: ядро може бути поза кадром навіть коли тіло частково видно
         if (!((x0 + Rc) < 0 || (x0 - Rc) >= img.w || (y0 + Rc) < 0 || (y0 - Rc) >= img.h)) {
-            // v3: окремі 1D ваги для ядра (інший sigma)
             const wxC = getGaussian1D_cached(core_sigma, fracX, Rc);
             const wyC = getGaussian1D_cached(core_sigma, fracY, Rc);
 
@@ -180,17 +170,27 @@ export function draw_atoms(img, atoms, coords, scale, background_gray, opts = {}
 
             for (let y = yStartC; y <= yEndC; y++) {
                 const wyv = wyC[(y - y0i) + Rc];
+                const row = y * img.w;
                 for (let x = xStartC; x <= xEndC; x++) {
-                    const add = core_intensity * (wxC[(x - x0i) + Rc] * wyv);
-                    const p = (y * img.w + x);
-                    img.a[p] += add;
+                    const g = wxC[(x - x0i) + Rc] * wyv;
+                    if (g <= 1e-9) continue;
+                    const p = row + x;
+                    coreAccum[p] += core_intensity * g;
                 }
             }
         }
     }
+
+    // Final grayscale composition.
+    // bodyDark використовує м'яку saturation-криву, щоб 1 атом виглядав майже як раніше,
+    // а колони з 2/3/4 атомів реально темнішали замість логіки "виграв один найтемніший".
+    for (let p = 0; p < img.a.length; p++) {
+        const bodyDark = background_gray * (1.0 - Math.exp(-darkAccum[p] * accumK));
+        img.a[p] = background_gray - bodyDark + coreAccum[p];
+    }
 }
 
-// opts: {wave_width_px, wave_amp}
+// opts: {wave_width_px, wave_amp}// opts: {wave_width_px, wave_amp}
 export function draw_bonds(img, coords, bonds, atoms, opts = {}) {
     const { wave_width_px = 8.0, wave_amp = 1.0 } = opts;
     const halfw = Math.max(1.0, wave_width_px * 0.5);
