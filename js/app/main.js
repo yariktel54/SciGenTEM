@@ -1319,17 +1319,17 @@ export async function interactive_em_image(smiles_text, _unused) {
     },
     "file:UAsSe.cif": {
       kind: "file",
-      path: "../../samples/UAsSe.cif",
-      name: "UAsSe.cif",
+      path: new URL("../../samples/Graphite.cif", import.meta.url).href,
+      name: "Graphite.cif",
     },
     "file:UAsSe.poscar": {
       kind: "file",
-      path: "../../samples/UAsSe.poscar",
-      name: "UAsSe.poscar",
+      path: new URL("../../samples/Corundum.poscar", import.meta.url).href,
+      name: "Corundum.poscar",
     },
     "file:pdb4hhb.ent": {
       kind: "file",
-      path: "../../samples/pdb4hhb.ent",
+      path: new URL("../../samples/pdb4hhb.ent", import.meta.url).href,
       name: "pdb4hhb.ent",
     },
   };
