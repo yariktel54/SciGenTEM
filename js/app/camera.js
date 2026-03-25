@@ -33,8 +33,58 @@ export function make_view_state(opts) {
     pan_px: [panX, panY],
     rotZ_rad: rotZ,
     center_A: [cxA, cyA, czA],
-    center_mode: opts.center_mode || 'bbox'
+    center_mode: opts.center_mode || "bbox",
   };
+}
+
+export function panBy(viewState, dx, dy) {
+  if (!viewState) return viewState;
+  if (!Array.isArray(viewState.pan_px)) viewState.pan_px = [0, 0];
+  var x = Number(viewState.pan_px[0]);
+  var y = Number(viewState.pan_px[1]);
+  if (!Number.isFinite(x)) x = 0;
+  if (!Number.isFinite(y)) y = 0;
+
+  dx = Number(dx);
+  dy = Number(dy);
+  if (!Number.isFinite(dx)) dx = 0;
+  if (!Number.isFinite(dy)) dy = 0;
+
+  viewState.pan_px[0] = x + dx;
+  viewState.pan_px[1] = y + dy;
+  return viewState;
+}
+
+export function resetPan(viewState) {
+  if (!viewState) return viewState;
+  viewState.pan_px = [0, 0];
+  return viewState;
+}
+
+export function rotateBy(viewState, dXdeg, dYdeg, dZdeg) {
+  if (!viewState) return viewState;
+
+  function addDeg(key, delta) {
+    var base = Number(viewState[key]);
+    delta = Number(delta);
+    if (!Number.isFinite(base)) base = 0;
+    if (!Number.isFinite(delta)) delta = 0;
+    viewState[key] = base + delta;
+  }
+
+  addDeg("tilt_x_deg", dXdeg);
+  addDeg("tilt_y_deg", dYdeg);
+  addDeg("rot_deg", dZdeg);
+  return viewState;
+}
+
+export function resetRotation(viewState) {
+  if (!viewState) return viewState;
+  viewState.tilt_x_deg = 0;
+  viewState.tilt_y_deg = 0;
+  viewState.rot_deg = 0;
+  if (Number.isFinite(viewState.rotZ_rad)) viewState.rotZ_rad = 0;
+  return viewState;
 }
 
 function _screen_center_px(viewState) {
@@ -79,6 +129,6 @@ export function world_aabb_xy(viewState, pad_px) {
     minx: Math.min.apply(null, xs),
     maxx: Math.max.apply(null, xs),
     miny: Math.min.apply(null, ys),
-    maxy: Math.max.apply(null, ys)
+    maxy: Math.max.apply(null, ys),
   };
 }
