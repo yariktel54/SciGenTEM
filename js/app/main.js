@@ -1857,19 +1857,38 @@ export async function interactive_em_image(smiles_text, _unused) {
   }
 
   function fileKindFromName(name) {
-    var low = String(name || "").toLowerCase();
-    // tolerate things like "file.cif;..." or "file.cif?x" in the #fragment
-    if (low.indexOf(".cif") >= 0) return "cif";
-    if (low.indexOf(".csv") >= 0) return "csv";
-    if (low.indexOf(".xyz") >= 0) return "xyz";
-    if (low.indexOf(".json") >= 0) return "json";
-    if (low.indexOf(".mol") >= 0) return "mol";
-    if (low.indexOf(".poscar") >= 0) return "poscar";
-    if (low.indexOf(".contcar") >= 0) return "poscar";
-    if (low.indexOf(".vasp") >= 0) return "poscar";
-    // common VASP names without extension
-    if (low === "poscar" || low === "contcar") return "poscar";
+    var low = String(name || "")
+      .trim()
+      .toLowerCase();
+    // tolerate things like "file.cif;..." / "file.cif?x" / blob urls with file name in hash
+    if (!low) return null;
+
+    // strip query/hash tail only for direct names; keep substring matching for blob-url fragments
+    var clean = low.split(/[?#]/)[0];
+    var tail = clean.split("/").pop() || clean;
+
+    if (tail.endsWith(".cif") || low.indexOf(".cif") >= 0) return "cif";
+    if (tail.endsWith(".csv") || low.indexOf(".csv") >= 0) return "csv";
+    if (tail.endsWith(".xyz") || low.indexOf(".xyz") >= 0) return "xyz";
+    if (tail.endsWith(".json") || low.indexOf(".json") >= 0) return "json";
+    if (tail.endsWith(".mol") || low.indexOf(".mol") >= 0) return "mol";
+    if (tail.endsWith(".pdb") || low.indexOf(".pdb") >= 0) return "pdb";
+    if (tail.endsWith(".ent") || low.indexOf(".ent") >= 0) return "pdb";
+    if (tail.endsWith(".poscar") || low.indexOf(".poscar") >= 0) return "poscar";
+    if (tail.endsWith(".contcar") || low.indexOf(".contcar") >= 0) return "poscar";
+    if (tail.endsWith(".vasp") || low.indexOf(".vasp") >= 0) return "poscar";
+
+    // common names without extension
+    if (tail === "poscar" || tail === "contcar") return "poscar";
+    if (tail === "pdb") return "pdb";
+
     return null;
+  }
+
+  function isPeriodicFileKind(kind, name) {
+    var fmt = kind ? String(kind).trim().toLowerCase() : "";
+    if (!fmt && name) fmt = fileKindFromName(name) || "";
+    return fmt === "cif" || fmt === "poscar";
   }
 
   function revokeFileUrl() {
