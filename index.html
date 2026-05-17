@@ -361,7 +361,6 @@
       #canvas {
         width: 100%;
         height: auto;
-        max-height: calc(100vh - 300px);
       }
 
       .header_help_row {
@@ -778,7 +777,7 @@
 
         .tem_view_sticky {
           position: static;
-          top: auto;
+          /* top: auto; */
         }
 
         #canvas {
@@ -1010,6 +1009,71 @@
       });
     </script>
 
+
+    <script>
+      document.addEventListener("DOMContentLoaded", function () {
+        function setHidden(el, hidden) {
+          if (!el) return;
+          el.classList.toggle("ui_hidden", !!hidden);
+        }
+
+        function syncBondExtraRows() {
+          const modeEl = document.getElementById("sel-mode");
+          const mode = modeEl ? String(modeEl.value || "").toUpperCase() : "";
+          const rowBonds = document.getElementById("row-bonds");
+          const bondsUnavailable =
+            mode === "STM" ||
+            (rowBonds &&
+              (rowBonds.classList.contains("ui_hidden") ||
+                rowBonds.hidden ||
+                rowBonds.style.display === "none"));
+
+          setHidden(document.getElementById("row-bwidth"), bondsUnavailable);
+          setHidden(document.getElementById("row-bamp"), bondsUnavailable);
+        }
+
+        function syncClipZControls() {
+          const cb = document.getElementById("cb-clipz-enabled");
+          const lo = document.getElementById("rng-clipz-min");
+          const hi = document.getElementById("rng-clipz-max");
+          const reset = document.getElementById("btn-clipz-reset");
+          if (!cb || !lo || !hi) return;
+
+          // The checkbox itself must stay available; only the two limits are inactive
+          // until Z-clip is enabled.
+          cb.disabled = false;
+          lo.disabled = !cb.checked;
+          hi.disabled = !cb.checked;
+          if (reset) reset.disabled = false;
+        }
+
+        function syncExtraUi() {
+          syncBondExtraRows();
+          syncClipZControls();
+        }
+
+        document
+          .getElementById("sel-mode")
+          ?.addEventListener("change", syncExtraUi);
+        document
+          .getElementById("cb-clipz-enabled")
+          ?.addEventListener("change", syncExtraUi);
+
+        const rowBonds = document.getElementById("row-bonds");
+        if (rowBonds && window.MutationObserver) {
+          new MutationObserver(syncExtraUi).observe(rowBonds, {
+            attributes: true,
+            attributeFilter: ["class", "style", "hidden"],
+          });
+        }
+
+        syncExtraUi();
+        requestAnimationFrame(syncExtraUi);
+        setTimeout(syncExtraUi, 250);
+      });
+    </script>
+
+
     <script type="module">
       import { interactive_em_image } from "./js/app/main.js";
 
@@ -1038,7 +1102,7 @@
         </div>
         <div>
           <h1 style="margin: auto 0px 0px" id="pageTitle">
-            SciGenTEM Візуалізатор
+            SciGenEM Візуалізатор
           </h1>
           <div class="header_help_row">
             <a
@@ -1071,7 +1135,8 @@
                   class="error"
                   style="display: none"
                 ></div>
-                <div id="smiles-status" class="smiles_status_panel ui_hidden">
+
+                <!--<div id="smiles-status" class="smiles_status_panel ui_hidden">
                   <div
                     id="smiles-status-title"
                     class="smiles_status_title"
@@ -1101,6 +1166,7 @@
                     class="smiles_status_line ui_hidden"
                   ></div>
                 </div>
+                -->
               </div>
 
               <div class="tem_full">
@@ -1348,64 +1414,6 @@
                     >Reset edits: object</span
                   >
                 </button>
-
-                <details
-                  class="object_advanced_details"
-                  id="object-advanced-details"
-                >
-                  <summary id="ui.objectAdvanced.title">
-                    Додаткове редагування
-                  </summary>
-                  <div class="clipz_block">
-                    <label class="clipz_toggle">
-                      <input
-                        type="checkbox"
-                        id="cb-clipz-enabled"
-                        data-i18n-title="tooltip.clipZ"
-                      />
-                      <span id="ui.clipZ.enable">Обрізка шарів (Z-clip)</span>
-                    </label>
-                    <div class="clipz_ranges">
-                      <div>
-                        <label id="ui.clipZ.min" for="rng-clipz-min"
-                          >Z min</label
-                        >
-                        <input
-                          type="range"
-                          id="rng-clipz-min"
-                          min="0"
-                          max="1"
-                          step="0.01"
-                          value="0"
-                        />
-                      </div>
-                      <div>
-                        <label id="ui.clipZ.max" for="rng-clipz-max"
-                          >Z max</label
-                        >
-                        <input
-                          type="range"
-                          id="rng-clipz-max"
-                          min="0"
-                          max="1"
-                          step="0.01"
-                          value="1"
-                        />
-                      </div>
-                    </div>
-                    <div class="clipz_values" id="lbl-clipz-values">
-                      min=0.00 max=1.00
-                    </div>
-                    <button
-                      type="button"
-                      class="object_edit_reset"
-                      id="btn-clipz-reset"
-                      data-i18n-title="tooltip.clipZ"
-                    >
-                      Reset clip
-                    </button>
-                  </div>
-                </details>
               </div>
 
               <div class="tem_full" id="mode-block">
@@ -1453,9 +1461,9 @@
                 <input
                   type="range"
                   id="rng-zoom"
-                  min="0.05"
-                  max="0.5"
-                  step="0.05"
+                  min="0.01"
+                  max="1.0"
+                  step="0.005"
                   value="0.1"
                 />
               </div>
@@ -1559,7 +1567,70 @@
                   />
                 </div>
 
-                <div class="range_row">
+                <div
+                  class="object_advanced_details"
+                  id="object-advanced-details"
+                  style="margin-top: 12px"
+                >
+                  <div
+                    id="ui.objectAdvanced.title"
+                    style="font-weight: 700; margin-bottom: 8px"
+                  >
+                    Додаткове редагування
+                  </div>
+<div class="clipz_block">
+                    <label class="clipz_toggle">
+                      <input
+                        type="checkbox"
+                        id="cb-clipz-enabled"
+                        data-i18n-title="tooltip.clipZ"
+                      />
+                      <span id="ui.clipZ.enable">Обрізка шарів (Z-clip)</span>
+                    </label>
+                    <div class="clipz_ranges">
+                      <div>
+                        <label id="ui.clipZ.min" for="rng-clipz-min"
+                          >Z min</label
+                        >
+                        <input
+                          type="range"
+                          id="rng-clipz-min"
+                          min="0"
+                          max="1"
+                          step="0.01"
+                          value="0"
+                        />
+                      </div>
+                      <div>
+                        <label id="ui.clipZ.max" for="rng-clipz-max"
+                          >Z max</label
+                        >
+                        <input
+                          type="range"
+                          id="rng-clipz-max"
+                          min="0"
+                          max="1"
+                          step="0.01"
+                          value="1"
+                        />
+                      </div>
+                    </div>
+                    <div class="clipz_values" id="lbl-clipz-values">
+                      min=0.00 max=1.00
+                    </div>
+                    <button
+                      type="button"
+                      class="object_edit_reset"
+                      id="btn-clipz-reset"
+                      data-i18n-title="tooltip.clipZ"
+                    >
+                      Reset clip
+                    </button>
+                  </div>
+                </div>
+
+
+                <div class="range_row" id="row-bwidth">
                   <label id="lblBWidth" for="rng-bwidth"
                     >Ширина зв’язків (px)</label
                   >
@@ -1567,13 +1638,13 @@
                     type="range"
                     id="rng-bwidth"
                     min="0.1"
-                    max="4"
+                    max="10"
                     step="0.05"
                     value="6"
                   />
                 </div>
 
-                <div class="range_row">
+                <div class="range_row" id="row-bamp">
                   <label id="lblBAmp" for="rng-bamp">Яскравість зв’язків</label>
                   <input
                     type="range"
@@ -1656,53 +1727,6 @@
         </div>
 
         <div class="tem_view">
-          <div class="authors_panel">
-            <div class="authors_panel_row">
-              <h2 class="authors_panel_title" id="authorsLabel">Автори:</h2>
-              <div class="authors_list">
-                <a
-                  class="author_link"
-                  href="https://people.epfl.ch/nataliia.miroshnichenko"
-                  id="author_1"
-                  >Наталія Їлмаз</a
-                >
-                <a class="author_link" href="" id="author_2"
-                  >Ярослав Теляшенко</a
-                >
-                <a
-                  class="author_link"
-                  href="https://nure.ua/en/staff/pavlo-kozub"
-                  id="author_3"
-                  >Павло Козуб</a
-                >
-              </div>
-            </div>
-            <div class="authors_panel_row">
-              <div class="cooperation_title" id="cooperationLabel">
-                У кооперації
-              </div>
-              <div class="coop_logos">
-                <a
-                  class="coop_logo_link"
-                  href="https://nure.ua/"
-                  target="_blank"
-                  rel="noopener"
-                  title="Kharkiv National University of Radio Electronics"
-                >
-                  <img src="./samples/nure.jpg" alt="NURE" id="coopLogoNure" />
-                </a>
-                <a
-                  class="coop_logo_link"
-                  href="https://www.epfl.ch/en/"
-                  target="_blank"
-                  rel="noopener"
-                  title="Federal School of Technology in Lausanne"
-                >
-                  <img src="./samples/epfl.jpg" alt="EPFL" id="coopLogoEpfl" />
-                </a>
-              </div>
-            </div>
-          </div>
           <div class="main-block tem_view_sticky">
             <h2 id="vizTitle">Візуалізатор</h2>
 
@@ -1788,6 +1812,53 @@
             <div class="canvas_meta">
               <div class="small_links"></div>
               <div class="muted" id="lbl-title"></div>
+            </div>
+          </div>
+          <div class="authors_panel">
+            <div class="authors_panel_row">
+              <h2 class="authors_panel_title" id="authorsLabel">Автори:</h2>
+              <div class="authors_list">
+                <a
+                  class="author_link"
+                  href="https://people.epfl.ch/nataliia.miroshnichenko"
+                  id="author_1"
+                  >Наталія Їлмаз</a
+                >
+                <a class="author_link" href="" id="author_2"
+                  >Ярослав Теляшенко</a
+                >
+                <a
+                  class="author_link"
+                  href="https://nure.ua/en/staff/pavlo-kozub"
+                  id="author_3"
+                  >Павло Козуб</a
+                >
+              </div>
+            </div>
+            <div class="authors_panel_row">
+              <div class="cooperation_title" id="cooperationLabel">
+                У кооперації
+              </div>
+              <div class="coop_logos">
+                <a
+                  class="coop_logo_link"
+                  href="https://nure.ua/"
+                  target="_blank"
+                  rel="noopener"
+                  title="Kharkiv National University of Radio Electronics"
+                >
+                  <img src="./samples/nure.jpg" alt="NURE" id="coopLogoNure" />
+                </a>
+                <a
+                  class="coop_logo_link"
+                  href="https://www.epfl.ch/en/"
+                  target="_blank"
+                  rel="noopener"
+                  title="Federal School of Technology in Lausanne"
+                >
+                  <img src="./samples/epfl.jpg" alt="EPFL" id="coopLogoEpfl" />
+                </a>
+              </div>
             </div>
           </div>
         </div>

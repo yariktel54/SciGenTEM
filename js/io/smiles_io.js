@@ -129,6 +129,81 @@ function _make_strict_error(trust) {
   return err;
 }
 
+function _single_atom_geometry_is_relaxable(backend, geometry, trust) {
+  const reasons = trust && Array.isArray(trust.rejectReasons) ? trust.rejectReasons : [];
+  if (!reasons.length) return false;
+
+  const allowedReasons = new Set([
+    "geometry_mode_fallback_circle",
+    "geometry_degenerate",
+  ]);
+  for (const r of reasons) {
+    if (!allowedReasons.has(String(r || ""))) return false;
+  }
+
+  const atoms = geometry && Array.isArray(geometry.atoms) ? geometry.atoms : [];
+  const coords = geometry && Array.isArray(geometry.coords) ? geometry.coords : [];
+  const identityCount =
+    backend && backend.identity && Number.isFinite(backend.identity.atomCount)
+      ? backend.identity.atomCount | 0
+      : 0;
+  const atomCount = atoms.length || identityCount;
+  if (atomCount !== 1) return false;
+  if (!geometry || !geometry.ok || !geometry.coordsAvailable) return false;
+  if (coords.length !== 1) return false;
+
+  const c = coords[0] || {};
+  return Number.isFinite(Number(c.x)) && Number.isFinite(Number(c.y));
+}
+
+function _relax_single_atom_geometry_trust(backend, geometry, trust) {
+  if (!_single_atom_geometry_is_relaxable(backend, geometry, trust)) return trust;
+  return {
+    ...(trust || {}),
+    geometryTrusted: true,
+    renderTrusted: true,
+    strictOk: true,
+    trustLevel: "strict_ok",
+    rejectReasons: [],
+  };
+}
+
+function _debug_smiles_pipeline(token, backend, geometry, trust) {
+  if (!_smiles_io_dev()) return;
+  const identity = backend && backend.identity ? backend.identity : {};
+  console.log("[SMILES DEBUG]", {
+    token: String(token || ""),
+    backend: {
+      ok: !!(backend && backend.ok),
+      atomCount: identity.atomCount ?? 0,
+      hydrogenMode: identity.hydrogenMode || "unsupported",
+      explicitHydrogenCount: identity.explicitHydrogenCount ?? 0,
+      implicitHydrogenCount: identity.implicitHydrogenCount ?? 0,
+      atomsLength: Array.isArray(backend && backend.atoms) ? backend.atoms.length : 0,
+      bondsLength: Array.isArray(backend && backend.bonds) ? backend.bonds.length : 0,
+      coordsLength: Array.isArray(backend && backend.coords) ? backend.coords.length : 0,
+      geometryOrigin: backend && backend.geometryOrigin ? backend.geometryOrigin : "failed",
+      warnings: Array.isArray(backend && backend.warnings) ? backend.warnings.slice(0, 16) : [],
+    },
+    geometry: {
+      ok: !!(geometry && geometry.ok),
+      geometryMode: geometry && geometry.geometryMode ? geometry.geometryMode : "failed",
+      coordsAvailable: !!(geometry && geometry.coordsAvailable),
+      degenerateCoords: !!(geometry && geometry.degenerateCoords),
+      usedFallbackCoords: !!(geometry && geometry.usedFallbackCoords),
+      atomsLength: Array.isArray(geometry && geometry.atoms) ? geometry.atoms.length : 0,
+      bondsLength: Array.isArray(geometry && geometry.bonds) ? geometry.bonds.length : 0,
+      coordsLength: Array.isArray(geometry && geometry.coords) ? geometry.coords.length : 0,
+      warnings: Array.isArray(geometry && geometry.warnings) ? geometry.warnings.slice(0, 16) : [],
+    },
+    trust: {
+      strictOk: !!(trust && trust.strictOk),
+      trustLevel: trust && trust.trustLevel ? trust.trustLevel : "rejected",
+      rejectReasons: Array.isArray(trust && trust.rejectReasons) ? trust.rejectReasons.slice(0, 16) : [],
+    },
+  });
+}
+
 function _attach_smiles_backend_to_mol(mol, backend, geometry, trust) {
   if (!mol) return;
   try {
@@ -174,7 +249,8 @@ export async function create_molecule_from_smiles(smiles, options) {
 
   const backend = RDKit.build_smiles_backend_result(smiles);
   const geometry = RDKit.finalize_smiles_geometry(backend);
-  const trust = RDKit.assess_smiles_trust({ backend, geometry });
+  let trust = RDKit.assess_smiles_trust({ backend, geometry });
+  trust = _relax_single_atom_geometry_trust(backend, geometry, trust);
   const mol = backend && backend.mol ? backend.mol : null;
 
   const replacementStatus =
@@ -222,6 +298,8 @@ export async function create_molecule_from_smiles(smiles, options) {
     rejectReasons: trust?.rejectReasons || [],
   });
 
+  _debug_smiles_pipeline(smiles, backend, geometry, trust);
+
   if (!backend || !backend.ok || !mol) {
     throw new Error("Не вдалося зчитати SMILES: " + smiles);
   }
@@ -256,8 +334,11 @@ export function get_atoms_with_coords(mol, use_2d_if_fail = true, options) {
   if (!geometry || !geometry.ok) {
     geometry = RDKit.finalize_smiles_geometry(backend || mol);
     trust = RDKit.assess_smiles_trust({ backend, geometry });
+    trust = _relax_single_atom_geometry_trust(backend, geometry, trust);
     _attach_smiles_backend_to_mol(mol, backend, geometry, trust);
   }
+
+  trust = _relax_single_atom_geometry_trust(backend, geometry, trust);
 
   if (opts.strictChemistry && (!trust || !trust.strictOk)) {
     throw _make_strict_error(trust);

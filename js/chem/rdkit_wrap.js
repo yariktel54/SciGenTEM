@@ -7,6 +7,8 @@ import { ensureOpenChemLibLoaded, getOpenChemLibModule, getOpenChemLibLoaderStat
 
 let _RDKit = null;
 
+const SCIGENEM_RDKIT_WRAP_BUILD_MARKER = "smiles-explicit-h-geometry-repair-2026-05-17";
+
 const ELEMENT_SYMBOLS = [
   null,
   "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
@@ -1066,10 +1068,18 @@ function req() {
 
 function dev_enabled() {
   try {
-    return !!(typeof window !== "undefined" && window && window.TEM_DEV === true);
-  } catch (_) {
-    return false;
-  }
+    if (typeof window !== "undefined" && window && window.TEM_DEV === true) return true;
+  } catch (_) {}
+  try {
+    if (typeof location !== "undefined" && location && location.search) {
+      const qs = new URLSearchParams(location.search);
+      if (qs.get("tem_dev") === "1") return true;
+    }
+  } catch (_) {}
+  try {
+    if (typeof localStorage !== "undefined" && localStorage.getItem("TEM_DEV") === "1") return true;
+  } catch (_) {}
+  return false;
 }
 
 function dlog(...args) {
@@ -2179,6 +2189,43 @@ function push_reject_reason(out, code) {
   push_unique_warning(out.rejectReasons, code);
 }
 
+function is_nonfatal_smiles_build_reason(code) {
+  // These reasons describe render-layout quality or implicit-H materialization
+  // quality. They must remain visible as warnings, but they are not chemical
+  // syntax/topology failures and should not block building a scene.
+  const c = String(code || "").trim();
+  return (
+    c === "hydrogen_not_explicit" ||
+    c === "replacement_explicit_h_materialization_unavailable" ||
+    c === "replacement_explicit_h_bridge_failed" ||
+    c === "replacement_explicit_h_roundtrip_failed" ||
+    c === "replacement_geometry_regressed_after_materialization" ||
+    c === "geometry_mode_2d_generated" ||
+    c === "geometry_mode_fallback_circle" ||
+    c === "geometry_mode_replacement_2d_untrusted" ||
+    c === "geometry_degenerate" ||
+    c === "geometry_2d_generation_failed"
+  );
+}
+
+function coords_are_finite_2d(coords) {
+  const arr = Array.isArray(coords) ? coords : [];
+  if (!arr.length) return false;
+  for (let i = 0; i < arr.length; i++) {
+    const c = arr[i] || {};
+    if (!Number.isFinite(Number(c.x)) || !Number.isFinite(Number(c.y))) return false;
+  }
+  return true;
+}
+
+function has_fatal_smiles_build_reason(reasons) {
+  const arr = Array.isArray(reasons) ? reasons : [];
+  for (let i = 0; i < arr.length; i++) {
+    if (!is_nonfatal_smiles_build_reason(arr[i])) return true;
+  }
+  return false;
+}
+
 function resolve_backend_from_input_for_trust(input) {
   if (!input || typeof input !== "object") return null;
   if (input.backend && input.backend.mol) return input.backend;
@@ -2464,6 +2511,32 @@ function build_smiles_backend_result(smiles) {
     geometryOrigin = replacement && replacement.ok ? (replacement.geometryOrigin || "replacement_none") : "rdkit";
   }
 
+  let explicitHCoordRepairApplied = false;
+  if (atoms.length > 0) {
+    const coordProblem =
+      coords.length !== atoms.length ||
+      coords.length === 0 ||
+      (coords.length > 1 && are_atoms_degenerate(coords));
+    if (coordProblem) {
+      const repairCandidates = [coords, replacementCoords, rdkitCoords, get_coordinates_safe(mol).map(clone_coord_record)];
+      for (let i = 0; i < repairCandidates.length; i++) {
+        const repaired = repair_explicit_h_coordinates(atoms, bonds, repairCandidates[i]);
+        if (repaired && repaired.length === atoms.length && (repaired.length === 1 || !are_atoms_degenerate(repaired))) {
+          coords = repaired;
+          geometryOrigin = "2d_generated";
+          explicitHCoordRepairApplied = true;
+          break;
+        }
+      }
+    }
+  }
+
+  if (explicitHCoordRepairApplied && replacement && Array.isArray(replacement.warnings)) {
+    replacement.warnings = replacement.warnings.filter(function (w) {
+      return !is_nonfatal_geometry_attempt_warning(w);
+    });
+  }
+
   result.atoms = atoms;
   result.bonds = bonds;
   result.coords = coords;
@@ -2474,11 +2547,13 @@ function build_smiles_backend_result(smiles) {
   result.authoritativeHydrogenSource = replacement && replacement.ok
     ? (replacement.authoritativeHydrogenSource || (identity.hydrogenMode === "explicit" ? "openchemlib" : "fallback"))
     : (identity.hydrogenMode === "explicit" ? "rdkit" : "fallback");
-  result.authoritativeGeometrySource = rdkitCoordsUsable
-    ? "rdkit"
-    : replacement && replacement.ok
-      ? (replacement.authoritativeGeometrySource || "fallback")
-      : "rdkit";
+  result.authoritativeGeometrySource = explicitHCoordRepairApplied
+    ? "layout_repair"
+    : rdkitCoordsUsable
+      ? "rdkit"
+      : replacement && replacement.ok
+        ? (replacement.authoritativeGeometrySource || "fallback")
+        : "rdkit";
   result.authoritativeMolKind = replacement_is_wrapper_mol(mol)
     ? "wrapper_only"
     : replacement && replacement.ok
@@ -2526,7 +2601,8 @@ function build_smiles_backend_result(smiles) {
       bridgeRepresentation: replacement.diagnostics && replacement.diagnostics.bridgeRepresentation ? replacement.diagnostics.bridgeRepresentation : ""
     } : null,
     rdkitRawAtomCount: raw_get_num_atoms(mol),
-    rdkitRawBondCount: raw_get_num_bonds(mol)
+    rdkitRawBondCount: raw_get_num_bonds(mol),
+    geometryRepair: explicitHCoordRepairApplied ? "explicit_h_2d_layout" : "none"
   };
 
   if (!(atomCountFromMol > 0)) push_group_warning(result.warningGroups, result.warnings, "backend", "mol_has_no_atoms");
@@ -2645,9 +2721,250 @@ function atoms_from_identity_circle(identity, radius = 3.0) {
   return out;
 }
 
+function atoms_to_circle_layout(atoms, radius = 3.0) {
+  const src = Array.isArray(atoms) ? atoms : [];
+  const n = src.length;
+  if (!(n > 0)) return [];
+  if (n === 1) {
+    const a0 = clone_atom_record(src[0]);
+    a0.x = radius;
+    a0.y = 0;
+    a0.z = Number.isFinite(Number(a0.z)) ? Number(a0.z) : 0;
+    return [a0];
+  }
+  return src.map((a, i) => {
+    const t = (2 * Math.PI * i) / n;
+    const out = clone_atom_record(a);
+    out.x = Math.cos(t) * radius;
+    out.y = Math.sin(t) * radius;
+    out.z = Number.isFinite(Number(out.z)) ? Number(out.z) : 0;
+    return out;
+  });
+}
+
+function atom_record_is_hydrogen(atom) {
+  const a = atom && typeof atom === "object" ? atom : {};
+  const sym = normalize_symbol(a.sym || a.label || a.symbol);
+  const z = Number.isFinite(a.Z) ? (a.Z | 0) : parse_int_safe(a.Z, 0);
+  return sym === "H" || z === 1;
+}
+
+function coord_is_finite_xy(coord) {
+  const c = coord && typeof coord === "object" ? coord : null;
+  if (!c) return false;
+  return Number.isFinite(Number(c.x)) && Number.isFinite(Number(c.y));
+}
+
+function clone_finite_coord_or_null(coord) {
+  if (!coord_is_finite_xy(coord)) return null;
+  const c = clone_coord_record(coord);
+  c.z = Number.isFinite(Number(c.z)) ? Number(c.z) : 0;
+  return c;
+}
+
+function h_bond_length_for_heavy_atom(atom) {
+  const z = Number.isFinite(atom && atom.Z) ? (atom.Z | 0) : parse_int_safe(atom && atom.Z, 0);
+  const sym = normalize_symbol(atom && atom.sym);
+  if (z === 6 || sym === "C") return 1.09;
+  if (z === 7 || sym === "N") return 1.01;
+  if (z === 8 || sym === "O") return 0.96;
+  if (z === 9 || sym === "F") return 0.92;
+  if (z === 15 || sym === "P") return 1.42;
+  if (z === 16 || sym === "S") return 1.34;
+  if (z === 17 || sym === "Cl") return 1.27;
+  return 1.05;
+}
+
+function assign_missing_heavy_coords_for_repair(atoms, out) {
+  const heavy = [];
+  for (let i = 0; i < atoms.length; i++) {
+    if (!atom_record_is_hydrogen(atoms[i])) heavy.push(i);
+  }
+  if (!heavy.length) return;
+
+  let completeHeavyCoords = [];
+  for (let k = 0; k < heavy.length; k++) {
+    const idx = heavy[k];
+    if (out[idx]) completeHeavyCoords.push(out[idx]);
+  }
+
+  const heavyDegenerate = completeHeavyCoords.length === heavy.length && heavy.length > 1 && are_atoms_degenerate(completeHeavyCoords);
+  if (heavyDegenerate) {
+    for (let k = 0; k < heavy.length; k++) out[heavy[k]] = null;
+  }
+
+  const fallbackHeavyAtoms = heavy.map(function (idx) {
+    return atoms[idx];
+  });
+  const fallback = atoms_to_circle_layout(fallbackHeavyAtoms, Math.max(1.5, heavy.length * 0.8));
+
+  for (let k = 0; k < heavy.length; k++) {
+    const idx = heavy[k];
+    if (out[idx]) continue;
+    const atom = atoms[idx] || {};
+    if (coord_is_finite_xy(atom) && !(heavy.length > 1 && Math.abs(Number(atom.x)) < 1e-12 && Math.abs(Number(atom.y)) < 1e-12)) {
+      out[idx] = clone_finite_coord_or_null(atom);
+      continue;
+    }
+    const f = fallback[k] || {};
+    out[idx] = {
+      x: Number.isFinite(Number(f.x)) ? Number(f.x) : 0,
+      y: Number.isFinite(Number(f.y)) ? Number(f.y) : 0,
+      z: Number.isFinite(Number(f.z)) ? Number(f.z) : 0
+    };
+  }
+}
+
+function average_neighbor_angle_for_h_layout(heavyIdx, atoms, bonds, out) {
+  const vectors = [];
+  const h0 = out[heavyIdx];
+  if (!h0) return 0;
+  const bondArr = Array.isArray(bonds) ? bonds : [];
+  for (let i = 0; i < bondArr.length; i++) {
+    const b = bondArr[i];
+    if (!Array.isArray(b) || b.length < 2) continue;
+    const a = parse_int_safe(b[0], -1);
+    const c = parse_int_safe(b[1], -1);
+    const other = a === heavyIdx ? c : c === heavyIdx ? a : -1;
+    if (other < 0 || other >= atoms.length) continue;
+    if (atom_record_is_hydrogen(atoms[other])) continue;
+    if (!out[other]) continue;
+    const dx = Number(out[other].x) - Number(h0.x);
+    const dy = Number(out[other].y) - Number(h0.y);
+    if (Math.abs(dx) + Math.abs(dy) > 1e-8) vectors.push([dx, dy]);
+  }
+  if (!vectors.length) return -Math.PI / 2;
+  let sx = 0;
+  let sy = 0;
+  for (let i = 0; i < vectors.length; i++) {
+    const len = Math.hypot(vectors[i][0], vectors[i][1]) || 1;
+    sx += vectors[i][0] / len;
+    sy += vectors[i][1] / len;
+  }
+  if (Math.abs(sx) + Math.abs(sy) < 1e-8) return -Math.PI / 2;
+  return Math.atan2(sy, sx) + Math.PI;
+}
+
+function repair_explicit_h_coordinates(atoms, bonds, coords) {
+  const atomArr = Array.isArray(atoms) ? atoms : [];
+  const n = atomArr.length;
+  if (!(n > 0)) return null;
+
+  let hasHydrogen = false;
+  for (let i = 0; i < n; i++) {
+    if (atom_record_is_hydrogen(atomArr[i])) {
+      hasHydrogen = true;
+      break;
+    }
+  }
+  if (!hasHydrogen) return null;
+
+  const coordArr = Array.isArray(coords) ? coords : [];
+  const coordDegenerate = coordArr.length > 1 && are_atoms_degenerate(coordArr);
+  const out = new Array(n).fill(null);
+
+  for (let i = 0; i < Math.min(coordArr.length, n); i++) {
+    const c = clone_finite_coord_or_null(coordArr[i]);
+    if (!c) continue;
+    if (coordDegenerate && atom_record_is_hydrogen(atomArr[i])) continue;
+    out[i] = c;
+  }
+
+  assign_missing_heavy_coords_for_repair(atomArr, out);
+
+  const hByHeavy = Object.create(null);
+  const hAssigned = Object.create(null);
+  const bondArr = Array.isArray(bonds) ? bonds : [];
+  for (let i = 0; i < bondArr.length; i++) {
+    const b = bondArr[i];
+    if (!Array.isArray(b) || b.length < 2) continue;
+    const a = parse_int_safe(b[0], -1);
+    const c = parse_int_safe(b[1], -1);
+    if (a < 0 || c < 0 || a >= n || c >= n) continue;
+    const aH = atom_record_is_hydrogen(atomArr[a]);
+    const cH = atom_record_is_hydrogen(atomArr[c]);
+    if (aH === cH) continue;
+    const hIdx = aH ? a : c;
+    const heavyIdx = aH ? c : a;
+    if (!hByHeavy[heavyIdx]) hByHeavy[heavyIdx] = [];
+    if (!hAssigned[hIdx]) {
+      hByHeavy[heavyIdx].push(hIdx);
+      hAssigned[hIdx] = true;
+    }
+  }
+
+  for (const key in hByHeavy) {
+    if (!Object.prototype.hasOwnProperty.call(hByHeavy, key)) continue;
+    const heavyIdx = parse_int_safe(key, -1);
+    if (heavyIdx < 0 || !out[heavyIdx]) continue;
+    const list = hByHeavy[key];
+    const missing = [];
+    for (let i = 0; i < list.length; i++) {
+      const hIdx = list[i];
+      if (!out[hIdx] || coordDegenerate) missing.push(hIdx);
+    }
+    if (!missing.length) continue;
+    const center = out[heavyIdx];
+    const radius = h_bond_length_for_heavy_atom(atomArr[heavyIdx]);
+    const base = average_neighbor_angle_for_h_layout(heavyIdx, atomArr, bondArr, out);
+    const step = missing.length === 1 ? 0 : (2 * Math.PI) / missing.length;
+    const start = missing.length === 2 ? base - 0.95 : base;
+    for (let i = 0; i < missing.length; i++) {
+      const angle = missing.length === 2 ? start + i * 1.9 : start + i * step;
+      out[missing[i]] = {
+        x: Number(center.x) + Math.cos(angle) * radius,
+        y: Number(center.y) + Math.sin(angle) * radius,
+        z: Number.isFinite(Number(center.z)) ? Number(center.z) : 0
+      };
+    }
+  }
+
+  const unboundH = [];
+  for (let i = 0; i < n; i++) {
+    if (atom_record_is_hydrogen(atomArr[i]) && !out[i]) unboundH.push(i);
+  }
+  for (let i = 0; i < unboundH.length; i++) {
+    const angle = (2 * Math.PI * i) / Math.max(1, unboundH.length);
+    out[unboundH[i]] = { x: Math.cos(angle) * 1.1, y: Math.sin(angle) * 1.1, z: 0 };
+  }
+
+  const fullFallback = atoms_to_circle_layout(atomArr, 3.0);
+  for (let i = 0; i < n; i++) {
+    if (out[i]) continue;
+    const f = fullFallback[i] || {};
+    out[i] = {
+      x: Number.isFinite(Number(f.x)) ? Number(f.x) : 0,
+      y: Number.isFinite(Number(f.y)) ? Number(f.y) : 0,
+      z: Number.isFinite(Number(f.z)) ? Number(f.z) : 0
+    };
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (!coord_is_finite_xy(out[i])) return null;
+  }
+  if (n > 1 && are_atoms_degenerate(out)) return null;
+  return out.map(clone_coord_record);
+}
+
+function is_nonfatal_geometry_attempt_warning(code) {
+  const c = String(code || "").trim();
+  return (
+    c === "replacement_conformer_failed" ||
+    c === "replacement_mmff94_failed" ||
+    c === "replacement_inventCoordinates_failed" ||
+    c === "replacement_geometry_regressed_after_materialization"
+  );
+}
+
 function are_atoms_degenerate(atoms, eps = 1e-6) {
   const arr = Array.isArray(atoms) ? atoms : [];
-  if (arr.length < 2) return arr.length > 0;
+  if (arr.length === 0) return false;
+  if (arr.length === 1) {
+    const a = arr[0] || {};
+    const x = Number(a.x);
+    const y = Number(a.y);
+    return !Number.isFinite(x) || !Number.isFinite(y);
+  }
   let minx = Number(arr[0] && arr[0].x) || 0;
   let maxx = minx;
   let miny = Number(arr[0] && arr[0].y) || 0;
@@ -2820,16 +3137,19 @@ function build_smiles_geometry_result(input) {
     }
   }
 
-  if (geometryMode === "failed") {
-    if (!(atoms && atoms.length)) atoms = atoms_from_identity_circle(identity, 3.0);
-    if (atoms.length > 0) {
+  if (geometryMode === "failed" || degenerateCoords) {
+    const fallbackAtoms = atoms && atoms.length
+      ? atoms_to_circle_layout(atoms, 3.0)
+      : atoms_from_identity_circle(identity, 3.0);
+    if (fallbackAtoms.length > 0) {
+      atoms = fallbackAtoms;
       if (!(bonds && bonds.length) && Array.isArray(backend.bonds) && backend.bonds.length) {
         bonds = backend.bonds.map(clone_bond_record).filter(Boolean);
       }
       coords = atoms.map((a) => clone_coord_record(a));
       geometryMode = "fallback_circle";
       usedFallbackCoords = true;
-      degenerateCoords = false;
+      degenerateCoords = are_atoms_degenerate(coords);
       push_group_warning(out.warningGroups, out.warnings, "geometry", "fallback_2d_layout_applied");
     }
   }
@@ -2892,22 +3212,59 @@ function assess_smiles_trust(input) {
     (geometry && geometry.backend && geometry.backend.authoritativeGeometrySource) ||
     (backend && backend.authoritativeGeometrySource) ||
     "fallback";
-  const geometryTrusted = !!(
+
+  // Single-atom SMILES such as O, N, C, Cl, [Na+], [He] have no molecular
+  // extent in 2D/3D. A zero-size bbox is expected here and must not make the
+  // strict chemistry gate reject the structure as geometry_degenerate.
+  const geometryAtoms = geometry && Array.isArray(geometry.atoms) ? geometry.atoms : [];
+  const geometryCoords = geometry && Array.isArray(geometry.coords) ? geometry.coords : [];
+  const backendIdentityAtomCount = backend && backend.identity && Number.isFinite(backend.identity.atomCount)
+    ? (backend.identity.atomCount | 0)
+    : 0;
+  const singleAtomCoord = geometryCoords.length === 1 ? (geometryCoords[0] || {}) : null;
+  const singleAtomCoordFinite = !!(
+    singleAtomCoord &&
+    Number.isFinite(Number(singleAtomCoord.x)) &&
+    Number.isFinite(Number(singleAtomCoord.y))
+  );
+  const singleAtomGeometry = !!(
     geometry &&
     geometry.ok &&
-    !geometry.degenerateCoords &&
-    !geometry.usedFallbackCoords &&
+    geometry.coordsAvailable &&
+    singleAtomCoordFinite &&
+    (geometryAtoms.length === 1 || backendIdentityAtomCount === 1)
+  );
+  const singleAtomGeometryModeTrusted = !!(
+    singleAtomGeometry &&
     (
       geometryMode === "native" ||
       geometryMode === "embed3d" ||
       geometryMode === "replacement_2d" ||
-      ((geometryMode === "2d_generated") && authoritativeGeometrySource !== "fallback")
+      geometryMode === "2d_generated" ||
+      geometryMode === "fallback_circle"
+    )
+  );
+
+  const geometryTrusted = !!(
+    geometry &&
+    geometry.ok &&
+    (
+      singleAtomGeometryModeTrusted ||
+      (
+        !geometry.degenerateCoords &&
+        !geometry.usedFallbackCoords &&
+        (
+          geometryMode === "native" ||
+          geometryMode === "embed3d" ||
+          geometryMode === "replacement_2d" ||
+          ((geometryMode === "2d_generated") && authoritativeGeometrySource !== "fallback")
+        )
+      )
     )
   );
 
   out.geometryTrusted = geometryTrusted;
   out.renderTrusted = !!(out.topologyTrusted && out.identityTrusted && out.hydrogenTrusted && out.geometryTrusted);
-  out.strictOk = out.renderTrusted;
 
   if (base && Array.isArray(base.rejectReasons)) {
     for (let i = 0; i < base.rejectReasons.length; i++) push_reject_reason(out, base.rejectReasons[i]);
@@ -2922,12 +3279,32 @@ function assess_smiles_trust(input) {
     if (has_warning(geometryWarnings, "geometry_2d_generation_failed")) push_reject_reason(out, "geometry_2d_generation_failed");
   }
 
-  if (out.strictOk) out.trustLevel = "strict_ok";
+  const geometryRenderable = !!(
+    geometry &&
+    geometry.ok &&
+    geometry.coordsAvailable &&
+    Array.isArray(geometry.atoms) &&
+    Array.isArray(geometry.coords) &&
+    geometry.atoms.length > 0 &&
+    geometry.coords.length === geometry.atoms.length &&
+    coords_are_finite_2d(geometry.coords) &&
+    (!geometry.degenerateCoords || singleAtomGeometry)
+  );
+
+  // strictOk is the hard build gate. It must reject real chemistry/topology/
+  // identity failures, but not reject a valid SMILES solely because its render
+  // geometry came from a fallback or because hydrogens stayed implicit.
+  const chemistryBuildOk = !!(out.topologyTrusted && out.identityTrusted);
+  const fatalReasonsPresent = has_fatal_smiles_build_reason(out.rejectReasons);
+  out.strictOk = !!(chemistryBuildOk && geometryRenderable && !fatalReasonsPresent);
+
+  if (out.renderTrusted) out.trustLevel = "strict_ok";
   else if (!out.topologyTrusted) out.trustLevel = "rejected";
   else if (!out.identityTrusted && !out.hydrogenTrusted && !out.geometryTrusted) out.trustLevel = "topology_only";
   else if (!out.identityTrusted) out.trustLevel = "identity_degraded";
   else if (!out.hydrogenTrusted) out.trustLevel = "hydrogen_degraded";
   else if (!out.geometryTrusted) out.trustLevel = "geometry_degraded";
+  else if (out.strictOk) out.trustLevel = "build_ok_degraded";
   else out.trustLevel = "rejected";
 
   dlog("SMILES trust", {
@@ -3129,6 +3506,7 @@ rdkitReadyPromise.then((mod) => {
   }
 
   console.log("✅ RDKit WASM ініціалізовано");
+  dlog("loaded marker", SCIGENEM_RDKIT_WRAP_BUILD_MARKER);
 }).catch((e) => {
   console.error("❌ Помилка ініціалізації RDKit:", e);
 });
